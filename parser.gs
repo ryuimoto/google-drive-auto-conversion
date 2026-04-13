@@ -444,10 +444,17 @@ function parseGenericTable(text) {
  * @return {string} 'invoice' | 'table' | 'text'
  */
 function detectContentType(text) {
-  var invoiceKeywords = ['請求書', '請求番号', '御請求', 'Invoice', '請求金額'];
-  for (var i = 0; i < invoiceKeywords.length; i++) {
-    if (text.indexOf(invoiceKeywords[i]) !== -1) return 'invoice';
-  }
+  // ビジネス書類のキーワード判定（誤分類が起きにくい順）
+  if (/見積書|御見積|見積金額|見積番号|Quotation/.test(text)) return 'quote';
+  if (/注文書|発注書|注文番号|発注番号|Purchase\s*Order/.test(text)) return 'order';
+  if (/納品書|納品日/.test(text)) return 'delivery';
+  if (/領収書|領収証|但し書き/.test(text)) return 'receipt';
+  if (/請求書|御請求|請求金額|請求番号|Invoice/.test(text)) return 'invoice';
+
+  // テキスト系書類
+  if (/議事録|出席者|議題|開催日時/.test(text)) return 'minutes';
+  if (/契約書|契約期間|第\s*[一二三四五六七八九十0-9]+\s*条/.test(text)) return 'contract';
+  if (/報告書|業務報告|月次報告/.test(text)) return 'report';
 
   // テーブルっぽい構造を検出（タブ区切りや連続スペースの行が複数）
   var lines = text.split('\n');

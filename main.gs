@@ -94,26 +94,51 @@ function handleOcrRoute(fileId, fileName, mimeType) {
   var contentType = detectContentType(text);
   console.log('内容判定: ' + fileName + ' → ' + contentType);
 
-  if (contentType === 'invoice') {
+  // ビジネス書類グループ（Sheet出力）
+  var businessDocTypes = {
+    invoice:  '請求書',
+    receipt:  '領収書',
+    quote:    '見積書',
+    order:    '注文書',
+    delivery: '納品書',
+  };
+
+  if (businessDocTypes[contentType]) {
+    var docTypeLabel = businessDocTypes[contentType];
     var invoice = parseInvoice(text);
-    var sheetId = createInvoiceSheet(invoice, fileName);
+    var sheetId = createBusinessDocSheet(invoice, fileName, docTypeLabel);
     deleteTemporaryDoc(ocrDocId);
     logResult(fileName, 'success', sheetId);
     notifySuccess(fileName, sheetId, 'sheet');
+    return;
+  }
 
-  } else if (contentType === 'table') {
+  // 汎用テーブル
+  if (contentType === 'table') {
     var rows = parseGenericTable(text);
     var tableTitle = fileName.replace(/\.[^.]+$/, '');
     var tableSheetId = createGenericTableSheet(rows, tableTitle);
     deleteTemporaryDoc(ocrDocId);
     logResult(fileName, 'success', tableSheetId);
     notifySuccess(fileName, tableSheetId, 'sheet');
-
-  } else {
-    handleDocumentOutput(ocrDocId, fileName);
-    logResult(fileName, 'success', ocrDocId);
-    notifySuccess(fileName, ocrDocId, 'doc');
+    return;
   }
+
+  // テキスト系書類（議事録/契約書/報告書/その他）→ Doc 出力
+  var docPrefixes = {
+    contract: '契約書_',
+    minutes:  '議事録_',
+    report:   '報告書_',
+  };
+  var prefix = docPrefixes[contentType] || '';
+  // 元ファイル名が既に同じ接頭辞で始まっていれば重複を防ぐ
+  var renamedFileName = (prefix && fileName.indexOf(prefix) === 0)
+    ? fileName
+    : prefix + fileName;
+
+  handleDocumentOutput(ocrDocId, renamedFileName);
+  logResult(fileName, 'success', ocrDocId);
+  notifySuccess(fileName, ocrDocId, 'doc');
 }
 
 /**

@@ -12,8 +12,8 @@
 function handleDocumentOutput(ocrDocId, originalFileName) {
   var docFile = DriveApp.getFileById(ocrDocId);
 
-  // ファイル名を整形（_OCR接尾辞を除去し、元のファイル名ベースにリネーム）
-  var cleanName = originalFileName.replace(/\.pdf$/i, '');
+  // ファイル名を整形（拡張子を除去）
+  var cleanName = originalFileName.replace(/\.[^.]+$/, '');
   docFile.setName(cleanName);
 
   // 出力フォルダへ移動

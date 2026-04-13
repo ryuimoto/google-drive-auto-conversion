@@ -4,20 +4,39 @@
  */
 
 /**
- * 請求書データからスプレッドシートを作成
+ * 請求書データからスプレッドシートを作成（後方互換ラッパー）
  * @param {Object} invoice - parseInvoice()の戻り値
  * @param {string} originalFileName - 元PDFのファイル名
  * @return {string} 作成されたスプレッドシートのID
  */
 function createInvoiceSheet(invoice, originalFileName) {
-  var sheetName = '請求書_' + (invoice.invoiceNumber || originalFileName.replace(/\.pdf$/i, ''));
+  return createBusinessDocSheet(invoice, originalFileName, '請求書');
+}
+
+/**
+ * ビジネス書類（請求書/領収書/見積書/注文書/納品書）からスプレッドシートを作成
+ * @param {Object} invoice - parseInvoice()の戻り値
+ * @param {string} originalFileName - 元ファイル名
+ * @param {string} docType - 文書種別ラベル ('請求書' | '領収書' | '見積書' | '注文書' | '納品書')
+ * @return {string} 作成されたスプレッドシートのID
+ */
+function createBusinessDocSheet(invoice, originalFileName, docType) {
+  var baseName = originalFileName.replace(/\.[^.]+$/, '');
+  var prefix = docType + '_';
+  if (baseName.indexOf(prefix) === 0) {
+    baseName = baseName.substring(prefix.length);
+  }
+  var parts = [docType, baseName];
+  if (invoice.invoiceNumber) parts.push(invoice.invoiceNumber);
+  var sheetName = parts.join('_');
+
   var ss = SpreadsheetApp.create(sheetName);
   var sheet = ss.getActiveSheet();
-  sheet.setName('請求書データ');
+  sheet.setName(docType + 'データ');
 
   // ===== ヘッダー部 =====
   var row = 1;
-  sheet.getRange(row, 1).setValue('請求書番号').setFontWeight('bold');
+  sheet.getRange(row, 1).setValue(docType + '番号').setFontWeight('bold');
   sheet.getRange(row, 2).setValue(invoice.invoiceNumber || '（未検出）');
   row++;
 
