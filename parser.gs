@@ -8,6 +8,61 @@
  * @param {string} text - OCR抽出テキスト
  * @return {Object} パースされた請求書データ
  */
+/**
+ * ファイルから抽出したテキストを取引台帳の1エントリに変換
+ * @param {string} text - 抽出済みテキスト
+ * @param {string} fileName - 元ファイル名
+ * @param {string} fileLink - 元ファイルへのリンク
+ * @return {Object} 台帳エントリ
+ */
+function parseLedgerEntry(text, fileName, fileLink) {
+  var invoice = parseInvoice(text);
+  var contentType = detectContentType(text);
+
+  var docTypeLabels = {
+    invoice: '請求書',
+    receipt: '領収書',
+    quote: '見積書',
+    order: '注文書',
+    delivery: '納品書',
+    contract: '契約書',
+    minutes: '議事録',
+    report: '報告書',
+    table: '表データ',
+    text: 'その他',
+  };
+
+  // 内容サマリー: 明細の品名を最大3つカンマ区切り
+  var contentSummary = '';
+  if (invoice.items && invoice.items.length > 0) {
+    contentSummary = invoice.items.slice(0, 3)
+      .map(function(it) { return it.name; })
+      .join(', ');
+    if (invoice.items.length > 3) contentSummary += ' 他';
+  }
+
+  // ステータス判定: 取引先と合計金額の両方が取れていればOK
+  var hasKeyInfo = !!(invoice.vendorName && invoice.total);
+  var status = hasKeyInfo ? 'OK' : '部分抽出';
+
+  return {
+    processedAt: new Date(),
+    fileName: fileName,
+    fileLink: fileLink,
+    docType: docTypeLabels[contentType] || 'その他',
+    vendor: invoice.vendorName,
+    issueDate: invoice.issueDate,
+    docNumber: invoice.invoiceNumber,
+    total: invoice.total,
+    subtotal: invoice.subtotal,
+    tax: invoice.taxAmount,
+    paymentDueDate: invoice.paymentDueDate || '',
+    contentSummary: contentSummary,
+    rawText: text,
+    status: status,
+  };
+}
+
 function parseInvoice(text) {
   // 全角→半角変換済みテキストを用意
   const normalized = normalizeFullWidth(text);

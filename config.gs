@@ -27,6 +27,12 @@ const CFG = {
     maxFilesPerExecution: 5,  // 1回の実行で処理する最大ファイル数（6分制限対策）
   },
 
+  // 取引台帳設定
+  ledger: {
+    spreadsheetId: '',       // 取引台帳のスプレッドシートID（createLedgerSpreadsheet実行後に設定）
+    sheetName: '取引台帳',     // 台帳のタブ名
+  },
+
   // 通知設定
   notification: {
     enabled: true,

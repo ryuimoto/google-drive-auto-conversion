@@ -84,6 +84,25 @@ function extractTextFromDoc(docId) {
 }
 
 /**
+ * Google Spreadsheetから全セル内容をテキストとして抽出
+ * Excel/CSV由来のSheetからテキストを取り出すために使用
+ * @param {string} sheetId
+ * @return {string}
+ */
+function extractTextFromSheet(sheetId) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheets = ss.getSheets();
+  var allText = [];
+  for (var i = 0; i < sheets.length; i++) {
+    var data = sheets[i].getDataRange().getValues();
+    for (var r = 0; r < data.length; r++) {
+      allText.push(data[r].join('\t'));
+    }
+  }
+  return allText.join('\n');
+}
+
+/**
  * 一時Google Documentを削除
  * @param {string} docId - 削除するDocument ID
  */

@@ -19,7 +19,7 @@ function getNotificationRecipient() {
  * 変換完了メールを送信
  * @param {string} fileName - 元ファイル名
  * @param {string} outputFileId - 出力ファイルID
- * @param {string} outputType - 'sheet' | 'doc'
+ * @param {string} outputType - 'ledger' | 'sheet' | 'doc'
  */
 function notifySuccess(fileName, outputFileId, outputType) {
   if (!CFG.notification.enabled || !CFG.notification.notifyOnSuccess) return;
@@ -30,16 +30,29 @@ function notifySuccess(fileName, outputFileId, outputType) {
     return;
   }
 
-  const typeLabel = outputType === 'sheet' ? 'スプレッドシート' : 'ドキュメント';
-  const url = 'https://drive.google.com/file/d/' + outputFileId + '/view';
+  var typeLabel, url, headline;
+  if (outputType === 'ledger') {
+    typeLabel = '取引台帳';
+    url = 'https://docs.google.com/spreadsheets/d/' + outputFileId + '/edit';
+    headline = 'ファイルを取引台帳に追記しました。';
+  } else if (outputType === 'sheet') {
+    typeLabel = 'スプレッドシート';
+    url = 'https://drive.google.com/file/d/' + outputFileId + '/view';
+    headline = 'ファイルの変換が完了しました。';
+  } else {
+    typeLabel = 'ドキュメント';
+    url = 'https://drive.google.com/file/d/' + outputFileId + '/view';
+    headline = 'ファイルの変換が完了しました。';
+  }
+
   const subject = CFG.notification.subjectPrefix + '変換完了: ' + fileName;
 
   const htmlBody =
-    '<p><b>ファイルの変換が完了しました。</b></p>' +
+    '<p><b>' + headline + '</b></p>' +
     '<table style="border-collapse:collapse">' +
     '<tr><td style="padding:4px 12px 4px 0"><b>元ファイル</b></td><td>' + escapeHtml(fileName) + '</td></tr>' +
-    '<tr><td style="padding:4px 12px 4px 0"><b>変換種別</b></td><td>' + typeLabel + '</td></tr>' +
-    '<tr><td style="padding:4px 12px 4px 0"><b>出力ファイル</b></td><td><a href="' + url + '">' + url + '</a></td></tr>' +
+    '<tr><td style="padding:4px 12px 4px 0"><b>出力先</b></td><td>' + typeLabel + '</td></tr>' +
+    '<tr><td style="padding:4px 12px 4px 0"><b>リンク</b></td><td><a href="' + url + '">' + url + '</a></td></tr>' +
     '</table>';
 
   MailApp.sendEmail({

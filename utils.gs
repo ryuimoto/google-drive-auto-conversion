@@ -54,19 +54,121 @@ function isProcessed(file) {
 }
 
 /**
- * ファイルを処理済みとしてマーク＆処理済みフォルダへ移動
- * @param {string} fileId - 対象ファイルID
+ * ファイルを処理済みフォルダに整頓
+ * - [PROCESSED] マークを付与
+ * - 書類種別 × 年月のサブフォルダに振り分け
+ * - {日付}_{取引先}_{書類番号} 形式にリネーム
+ * @param {string} fileId
+ * @param {Object} entry - parseLedgerEntry()の戻り値
  */
-function markAsProcessed(fileId) {
-  const file = DriveApp.getFileById(fileId);
+function organizeProcessedFile(fileId, entry) {
+  var file = DriveApp.getFileById(fileId);
 
-  const currentDesc = file.getDescription() || '';
+  var currentDesc = file.getDescription() || '';
   file.setDescription('[PROCESSED] ' + currentDesc);
 
-  if (CFG.folders.processed) {
-    const processedFolder = DriveApp.getFolderById(CFG.folders.processed);
-    file.moveTo(processedFolder);
+  if (!CFG.folders.processed) return;
+
+  // 振り分け先の年月を決定（発行日 → なければ処理日時）
+  var dateForFolder = parseDateForFolder(entry.issueDate) || entry.processedAt;
+  var yearMonth = Utilities.formatDate(dateForFolder, 'Asia/Tokyo', 'yyyy-MM');
+
+  // 振り分け先フォルダ: 処理済み/書類種別/年月/
+  var processedRoot = DriveApp.getFolderById(CFG.folders.processed);
+  var typeFolder = getOrCreateSubfolder(processedRoot, entry.docType || 'その他');
+  var monthFolder = getOrCreateSubfolder(typeFolder, yearMonth);
+
+  // ファイル名のリネーム
+  var newName = buildOrganizedFileName(file.getName(), entry, dateForFolder);
+  if (newName !== file.getName()) {
+    var uniqueName = ensureUniqueName(monthFolder, newName);
+    file.setName(uniqueName);
   }
+
+  file.moveTo(monthFolder);
+  console.log('整頓: ' + (entry.docType || 'その他') + '/' + yearMonth + '/' + file.getName());
+}
+
+/**
+ * サブフォルダを取得（なければ作成）
+ * @param {GoogleAppsScript.Drive.Folder} parent
+ * @param {string} name
+ * @return {GoogleAppsScript.Drive.Folder}
+ */
+function getOrCreateSubfolder(parent, name) {
+  var iter = parent.getFoldersByName(name);
+  if (iter.hasNext()) return iter.next();
+  return parent.createFolder(name);
+}
+
+/**
+ * 整頓後のファイル名を組み立て
+ * 形式: {yyyy-MM-dd}_{取引先}_{書類番号}.{元拡張子}
+ * 抽出失敗項目は省略
+ * @param {string} originalName
+ * @param {Object} entry
+ * @param {Date} dateObj
+ * @return {string}
+ */
+function buildOrganizedFileName(originalName, entry, dateObj) {
+  var ext = '';
+  var extMatch = originalName.match(/\.([^.]+)$/);
+  if (extMatch) ext = '.' + extMatch[1];
+
+  var parts = [];
+  if (dateObj) {
+    parts.push(Utilities.formatDate(dateObj, 'Asia/Tokyo', 'yyyy-MM-dd'));
+  }
+  if (entry.vendor) parts.push(sanitizeForFileName(entry.vendor));
+  if (entry.docNumber) parts.push(sanitizeForFileName(entry.docNumber));
+
+  if (parts.length === 0) return originalName;
+  return parts.join('_') + ext;
+}
+
+/**
+ * ファイル名に使えない文字を置換
+ * @param {string} str
+ * @return {string}
+ */
+function sanitizeForFileName(str) {
+  return String(str).replace(/[\/\\:*?"<>|]/g, '_').trim();
+}
+
+/**
+ * 同名衝突時に (2), (3) ... を付与
+ * @param {GoogleAppsScript.Drive.Folder} folder
+ * @param {string} name
+ * @return {string}
+ */
+function ensureUniqueName(folder, name) {
+  if (!folder.getFilesByName(name).hasNext()) return name;
+
+  var ext = '';
+  var base = name;
+  var extMatch = name.match(/^(.+?)(\.[^.]+)$/);
+  if (extMatch) {
+    base = extMatch[1];
+    ext = extMatch[2];
+  }
+
+  for (var i = 2; i < 100; i++) {
+    var candidate = base + '(' + i + ')' + ext;
+    if (!folder.getFilesByName(candidate).hasNext()) return candidate;
+  }
+  return name;
+}
+
+/**
+ * 文字列日付（'2026/04/13' 等）を Date オブジェクトに変換
+ * @param {string} dateStr
+ * @return {Date|null}
+ */
+function parseDateForFolder(dateStr) {
+  if (!dateStr) return null;
+  var match = String(dateStr).match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (!match) return null;
+  return new Date(parseInt(match[1]), parseInt(match[2]) - 1, parseInt(match[3]));
 }
 
 /**
