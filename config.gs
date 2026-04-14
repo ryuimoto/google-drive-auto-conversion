@@ -1,14 +1,29 @@
 /**
  * PDF → Google スプレッドシート / ドキュメント 変換ツール
  * 設定ファイル
+ *
+ * フォルダID・台帳IDは setup() を実行するとScriptPropertiesに自動保存され、
+ * このファイルを編集する必要はありません。
  */
 
+// ScriptProperties に保存するキー（setup() が書き込み、CFG が読み込む）
+const PROP_KEYS = {
+  upload: 'FOLDER_UPLOAD_ID',
+  processed: 'FOLDER_PROCESSED_ID',
+  output: 'FOLDER_OUTPUT_ID',
+  ledger: 'LEDGER_SPREADSHEET_ID',
+};
+
+function _getProp(key) {
+  return PropertiesService.getScriptProperties().getProperty(key) || '';
+}
+
 const CFG = {
-  // フォルダID設定（Google DriveのフォルダIDを設定してください）
+  // フォルダIDは setup() 実行時に ScriptProperties に保存される
   folders: {
-    upload: '1lzldvYjzkZ2nCDYyd_bt3Z1Xzry96Xpt',          // 統合アップロードフォルダID
-    processed: '1Vx_his9zWZr-Wv8B2cM2_GbMtuume47w',       // 処理済み移動先フォルダID
-    output: '1xvKWeDFKi7HgMjs5uI0oLxy8buEfVaBn',          // 変換結果の出力先フォルダID
+    get upload() { return _getProp(PROP_KEYS.upload); },
+    get processed() { return _getProp(PROP_KEYS.processed); },
+    get output() { return _getProp(PROP_KEYS.output); },
   },
 
   // OCR設定
@@ -27,9 +42,9 @@ const CFG = {
     maxFilesPerExecution: 5,  // 1回の実行で処理する最大ファイル数（6分制限対策）
   },
 
-  // 取引台帳設定
+  // 取引台帳設定（spreadsheetId は setup() 実行時に ScriptProperties に保存される）
   ledger: {
-    spreadsheetId: '',       // 取引台帳のスプレッドシートID（createLedgerSpreadsheet実行後に設定）
+    get spreadsheetId() { return _getProp(PROP_KEYS.ledger); },
     sheetName: '取引台帳',     // 台帳のタブ名
   },
 

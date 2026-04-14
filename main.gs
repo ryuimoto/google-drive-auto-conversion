@@ -9,7 +9,7 @@
  */
 function scanAndProcessFiles() {
   if (!CFG.folders.upload) {
-    console.error('CFG.folders.upload が未設定です。createFolderStructure() を実行してから設定してください');
+    console.error('初期セットアップ未完了です。GASエディタで setup() を実行してください');
     return;
   }
 
@@ -180,9 +180,10 @@ function diagnose() {
   console.log('CFG.folders.upload: "' + CFG.folders.upload + '"');
   console.log('CFG.folders.processed: "' + CFG.folders.processed + '"');
   console.log('CFG.folders.output: "' + CFG.folders.output + '"');
+  console.log('CFG.ledger.spreadsheetId: "' + CFG.ledger.spreadsheetId + '"');
 
-  if (!CFG.folders.upload) {
-    console.error('upload フォルダIDが空です');
+  if (!CFG.folders.upload || !CFG.folders.processed || !CFG.folders.output || !CFG.ledger.spreadsheetId) {
+    console.error('初期セットアップが未完了です。GASエディタで setup() を実行してください');
     return;
   }
 
@@ -217,11 +218,74 @@ function diagnose() {
 // ===== セットアップ支援 =====
 
 /**
- * 取引台帳スプレッドシートを新規作成
- * 初回セットアップ時に1度だけ実行する
- * 実行後、ログに表示されるIDをCFG.ledger.spreadsheetIdに設定すること
+ * 初期セットアップを一括実行
+ *
+ * これ1つを実行すれば以下がすべて完了する:
+ *   1. マイドライブに「Googleドライブ自動変換」フォルダ階層を作成
+ *   2. 取引台帳スプレッドシートを作成
+ *   3. ScriptProperties に各IDを保存（config.gs の編集は不要）
+ *   4. 5分間隔のトリガーを登録
+ *
+ * 何度実行しても重複は作られない（冪等）。
  */
-function createLedgerSpreadsheet() {
+function setup() {
+  console.log('===== セットアップ開始 =====');
+
+  // 1. フォルダ構成を確保
+  var root = DriveApp.getRootFolder();
+  var parentFolder = getOrCreateSubfolder(root, 'Googleドライブ自動変換');
+  var uploadFolder = getOrCreateSubfolder(parentFolder, 'UPLOAD');
+  var processedFolder = getOrCreateSubfolder(parentFolder, '処理済み');
+  var outputFolder = getOrCreateSubfolder(parentFolder, '出力');
+
+  // 2. 取引台帳スプレッドシートを確保
+  var ledgerFile = findOrCreateLedger_(parentFolder);
+
+  // 3. ScriptProperties に保存
+  var props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    [PROP_KEYS.upload]: uploadFolder.getId(),
+    [PROP_KEYS.processed]: processedFolder.getId(),
+    [PROP_KEYS.output]: outputFolder.getId(),
+    [PROP_KEYS.ledger]: ledgerFile.getId(),
+  });
+
+  // 4. トリガー登録（既存があれば再作成）
+  setupTrigger();
+
+  console.log('');
+  console.log('===== セットアップ完了 =====');
+  console.log('親フォルダ : ' + parentFolder.getUrl());
+  console.log('UPLOAD    : ' + uploadFolder.getUrl());
+  console.log('処理済み   : ' + processedFolder.getUrl());
+  console.log('出力      : ' + outputFolder.getUrl());
+  console.log('取引台帳   : ' + ledgerFile.getUrl());
+  console.log('');
+  console.log('使い方: 上記「UPLOAD」フォルダにPDF/画像/Officeファイルを入れると、');
+  console.log('        ' + CFG.trigger.intervalMinutes + '分以内に自動変換されます。');
+}
+
+/**
+ * 親フォルダ内に取引台帳スプレッドシートを取得 or 新規作成（冪等）
+ * @param {GoogleAppsScript.Drive.Folder} parentFolder
+ * @return {GoogleAppsScript.Drive.File}
+ */
+function findOrCreateLedger_(parentFolder) {
+  // 既存のIDがあればそれを優先
+  var existingId = PropertiesService.getScriptProperties().getProperty(PROP_KEYS.ledger);
+  if (existingId) {
+    try {
+      return DriveApp.getFileById(existingId);
+    } catch (e) {
+      // ID無効化（削除されたなど） → 続けて新規作成
+    }
+  }
+
+  // 親フォルダ内を名前検索
+  var iter = parentFolder.getFilesByName('取引台帳');
+  if (iter.hasNext()) return iter.next();
+
+  // 新規作成
   var ss = SpreadsheetApp.create('取引台帳');
   var sheet = ss.getActiveSheet();
   sheet.setName(CFG.ledger.sheetName);
@@ -240,58 +304,12 @@ function createLedgerSpreadsheet() {
 
   sheet.setFrozenRows(1);
 
-  // 列幅を調整
-  sheet.setColumnWidth(1, 150);  // 処理日時
-  sheet.setColumnWidth(2, 200);  // 元ファイル名
-  sheet.setColumnWidth(3, 250);  // ファイルリンク
-  sheet.setColumnWidth(4, 80);   // 書類種別
-  sheet.setColumnWidth(5, 200);  // 取引先
-  sheet.setColumnWidth(6, 100);  // 発行日
-  sheet.setColumnWidth(7, 150);  // 書類番号
-  sheet.setColumnWidth(8, 100);  // 合計金額
-  sheet.setColumnWidth(9, 100);  // 小計
-  sheet.setColumnWidth(10, 100); // 消費税
-  sheet.setColumnWidth(11, 100); // 支払期限
-  sheet.setColumnWidth(12, 250); // 内容
-  sheet.setColumnWidth(13, 400); // 抽出元テキスト
-  sheet.setColumnWidth(14, 80);  // ステータス
-
-  // 親フォルダ（Googleドライブ自動変換）の直下に移動
-  if (CFG.folders.processed) {
-    var processedFolder = DriveApp.getFolderById(CFG.folders.processed);
-    var parents = processedFolder.getParents();
-    if (parents.hasNext()) {
-      var parentFolder = parents.next();
-      DriveApp.getFileById(ss.getId()).moveTo(parentFolder);
-    }
+  var widths = [150, 200, 250, 80, 200, 100, 150, 100, 100, 100, 100, 250, 400, 80];
+  for (var i = 0; i < widths.length; i++) {
+    sheet.setColumnWidth(i + 1, widths[i]);
   }
 
-  console.log('=== 取引台帳を作成しました ===');
-  console.log('');
-  console.log('以下のIDをconfig.gsのledger.spreadsheetIdに設定してください:');
-  console.log('');
-  console.log(ss.getId());
-  console.log('');
-  console.log('URL: ' + ss.getUrl());
-}
-
-
-/**
- * Google Driveにフォルダ構成を自動作成
- * 初回セットアップ時に実行し、作成されたフォルダIDをconfig.gsに設定する
- */
-function createFolderStructure() {
-  var root = DriveApp.getRootFolder();
-  var parentFolder = root.createFolder('Googleドライブ自動変換');
-
-  var uploadFolder = parentFolder.createFolder('UPLOAD');
-  var processedFolder = parentFolder.createFolder('処理済み');
-
-  console.log('=== フォルダを作成しました ===');
-  console.log('以下のIDをconfig.gsに設定してください:');
-  console.log('');
-  console.log('upload:    ' + uploadFolder.getId());
-  console.log('processed: ' + processedFolder.getId());
-  console.log('');
-  console.log('親フォルダ「Googleドライブ自動変換」: ' + parentFolder.getUrl());
+  var file = DriveApp.getFileById(ss.getId());
+  file.moveTo(parentFolder);
+  return file;
 }
