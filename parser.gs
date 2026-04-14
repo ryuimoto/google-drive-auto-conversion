@@ -436,20 +436,57 @@ function extractItemsColumnMajor(normalized) {
 
 /**
  * 指定ラベルの金額を抽出
+ * 「10%」などの税率を金額と誤認しないよう、%が後続する数値は除外する。
  * @param {string} text - テキスト
  * @param {string} label - ラベル（小計、消費税、合計）
  * @return {number}
  */
 function extractAmount(text, label) {
-  var patterns = [
-    new RegExp(label + '[：:　\\s]*[¥￥]?\\s*([\\d,]+)'),
-    new RegExp(label + '.*?([\\d,]+)\\s*円'),
-    new RegExp(label + '金額[：:　\\s]*[¥￥]?\\s*([\\d,]+)'),
-  ];
+  // ラベルバリエーション（より具体的な表記を先に試す）
+  var labelVariants;
+  if (label === '消費税') {
+    labelVariants = ['消費税額', '消費税等', '内消費税', '消費税'];
+  } else if (label === '小計') {
+    labelVariants = ['小計金額', '小計'];
+  } else if (label === '合計') {
+    labelVariants = ['ご請求金額', '請求金額', '合計金額', '総額', '合計'];
+  } else {
+    labelVariants = [label];
+  }
 
-  for (var i = 0; i < patterns.length; i++) {
-    var match = text.match(patterns[i]);
-    if (match) return parseNumber(match[1]);
+  // 行内の数値候補を抽出（%/％が後続するものは税率なので除外）
+  function collectAmounts(line) {
+    var amounts = [];
+    var re = /[¥￥]?\s*([\d,]+)(\s*[%％])?/g;
+    var m;
+    while ((m = re.exec(line)) !== null) {
+      if (m[2]) continue;  // %が後続 → 税率
+      var n = parseNumber(m[1]);
+      if (n > 0) amounts.push(n);
+    }
+    return amounts;
+  }
+
+  var lines = text.split('\n');
+  for (var v = 0; v < labelVariants.length; v++) {
+    var lab = labelVariants[v];
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf(lab) === -1) continue;
+
+      // ラベル位置以降の同一行を対象に金額を探す
+      var afterLabel = lines[i].substring(lines[i].indexOf(lab) + lab.length);
+      var nums = collectAmounts(afterLabel);
+
+      // 同一行で見つからない場合は次の行を見る
+      if (nums.length === 0 && i + 1 < lines.length) {
+        nums = collectAmounts(lines[i + 1]);
+      }
+
+      // 金額は税率より大きいはずなので最大値を採用
+      if (nums.length > 0) {
+        return Math.max.apply(null, nums);
+      }
+    }
   }
 
   return 0;
