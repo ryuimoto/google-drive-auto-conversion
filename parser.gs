@@ -64,14 +64,15 @@ function parseLedgerEntry(text, fileName, fileLink) {
 }
 
 function parseInvoice(text) {
-  // 2戦略を試行し、品質スコアが最高の結果を採用
+  // 3戦略を試行し、品質スコアが最高の結果を採用
   //   戦略A: 正規化なし(既存互換)
   //   戦略B: normalizeOcrText適用(全角区切り→改行、スペース縮約)
-  // 注: 全改行を空白化する "flat" 戦略は extractAmount が行末まで数値を拾ってしまい
-  //     口座番号等を誤検出するため採用しない。単一行レイアウトは extractItemsInline が対応する。
+  //   戦略C: 装飾スペース(1文字単位空白区切り)を圧縮したバージョン
+  // 全改行空白化の "flat" 戦略は extractAmount が口座番号等を誤検出するため不採用
   var variants = [
-    { name: 'raw',        text: text },
-    { name: 'normalized', text: normalizeOcrText(text) },
+    { name: 'raw',         text: text },
+    { name: 'normalized',  text: normalizeOcrText(text) },
+    { name: 'decompacted', text: decompactLetterSpacing(normalizeOcrText(text)) },
   ];
 
   var best = null;
@@ -111,6 +112,19 @@ function parseInvoiceOnce(normalized, original) {
     rawText: original,
   };
 
+  // 年なし日付のフォールバック: MM/DD のみでも文書中の年で補完
+  var fallbackYear = extractFirstYear(normalized) || new Date().getFullYear();
+  if (!result.issueDate) {
+    result.issueDate = findShortDateNearLabel(
+      normalized, ['発行日', 'Issue', 'ISSUED', 'Date', 'DATE'], fallbackYear
+    );
+  }
+  if (!result.paymentDueDate) {
+    result.paymentDueDate = findShortDateNearLabel(
+      normalized, ['支払期日', '支払期限', 'お支払期日', 'お支払期限', 'Payment Due', 'Due Date', 'DUE', 'Due'], fallbackYear
+    );
+  }
+
   // 小計+消費税から合計を逆算補完
   if (!result.total && result.subtotal && result.taxAmount) {
     result.total = result.subtotal + result.taxAmount;
@@ -121,6 +135,63 @@ function parseInvoiceOnce(normalized, original) {
   }
 
   return result;
+}
+
+/**
+ * 文書中で最初に出現する4桁年(1990〜2099)を返す
+ * @param {string} text
+ * @return {string}
+ */
+function extractFirstYear(text) {
+  var m = text.match(/\b(19|20)(\d{2})\b/);
+  if (m) return m[1] + m[2];
+  return '';
+}
+
+/**
+ * 年なし日付(MM/DD など)をラベル近傍から探し、指定年で補完して返す
+ * @param {string} text
+ * @param {string[]} labels
+ * @param {string} fallbackYear
+ * @return {string} "YYYY/MM/DD" または空
+ */
+function findShortDateNearLabel(text, labels, fallbackYear) {
+  var lines = text.split('\n');
+  for (var v = 0; v < labels.length; v++) {
+    var labRe = buildSpacedLabelRegex(labels[v], 'i');
+    for (var i = 0; i < lines.length; i++) {
+      var labMatch = lines[i].match(labRe);
+      if (!labMatch) continue;
+
+      // 英語ラベルの単語境界チェック
+      var charBefore = labMatch.index > 0 ? lines[i].charAt(labMatch.index - 1) : '';
+      var charAfter = lines[i].charAt(labMatch.index + labMatch[0].length);
+      if (/[A-Za-z]/.test(charBefore) || /[A-Za-z]/.test(charAfter)) continue;
+
+      // 同一行の末尾と次の3行を連結して探索
+      var target = lines[i].substring(labMatch.index + labMatch[0].length);
+      for (var k = i + 1; k < Math.min(i + 4, lines.length); k++) {
+        if (!lines[k].trim()) continue;
+        target += ' ' + lines[k];
+        break;
+      }
+
+      // まず完全日付を試す
+      var full = extractDate(target, target);
+      if (full) return full;
+
+      // MM/DD 形式を探す(括弧や他の数字との混同を避けるため厳しめ)
+      var shortMatch = target.match(/(?:^|\s)(\d{1,2})[\/\-.](\d{1,2})(?!\d)/);
+      if (shortMatch) {
+        var mm = parseInt(shortMatch[1], 10);
+        var dd = parseInt(shortMatch[2], 10);
+        if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+          return fallbackYear + '/' + (shortMatch[1].length === 1 ? '0' + mm : mm) + '/' + (shortMatch[2].length === 1 ? '0' + dd : dd);
+        }
+      }
+    }
+  }
+  return '';
 }
 
 /**
@@ -158,8 +229,11 @@ function extractInvoiceNumber(normalized, original) {
     new RegExp('発注番号[:：\\s]*(' + core + ')'),
     new RegExp('伝票番号[:：\\s]*(' + core + ')'),
     new RegExp('契約番号[:：\\s]*(' + core + ')'),
-    // No. (末尾が単語境界: NOTE等の部分一致を避ける)
-    new RegExp('\\bNo\\.?(?![A-Za-z])\\s*(' + core + ')', 'i'),
+    // No. はドット必須(NOTE等の誤マッチ回避)。単語境界は付けない(OCRが
+    // "I N V O I C ENo." のように直前の英字と結合するケースに対応するため)
+    new RegExp('No\\.\\s*(' + core + ')', 'i'),
+    // No (ドットなし) は単語境界ありで安全側に
+    new RegExp('\\bNo[:：\\s]+(' + core + ')(?![A-Za-z])', 'i'),
     new RegExp('\\bInvoice\\s*#?\\s*(' + core + ')', 'i'),
     new RegExp('\\bPO\\s*Number[:：\\s]*(' + core + ')', 'i'),
   ];
@@ -191,15 +265,20 @@ function extractInvoiceNumber(normalized, original) {
 
     var captured = match[1].replace(/\s+/g, '').trim();
 
-    // 「XXXX/2026」のように末尾がスラッシュ+4桁数字の場合、後続が日付かチェック
-    // (例: "No. PO-2026-0234 / 2026.04.14" の 2026 は年なのでスラッシュ以降を削除)
-    var tailMatch = captured.match(/^(.+?)\/(\d{4})$/);
-    if (tailMatch) {
-      var afterEndIdx = match.index + match[0].length;
-      var following = sourceText.substring(afterEndIdx, afterEndIdx + 10);
-      // 直後に .MM.DD / -MM-DD / 年 が続くなら年号部分を剥がす
-      if (/^[.\/-]\d{1,2}[.\/-]\d{1,2}/.test(following) || /^\s*年/.test(following)) {
-        captured = tailMatch[1];
+    // 末尾が "/YYYY" または "/YYYY-MM-DD" / "/YYYY/MM/DD" / "/YYYY.MM.DD" の場合は
+    // スラッシュ以降が日付混入とみなして剥がす
+    var dateTailMatch = captured.match(/^(.+?)\/(\d{4}[-\/.]\d{1,2}[-\/.]\d{1,2})$/);
+    if (dateTailMatch) {
+      captured = dateTailMatch[1];
+    } else {
+      // 単独の "/YYYY" は、後続の原文に 年/日付記号 が続く場合のみ剥がす
+      var yearTailMatch = captured.match(/^(.+?)\/(\d{4})$/);
+      if (yearTailMatch) {
+        var afterEndIdx = match.index + match[0].length;
+        var following = sourceText.substring(afterEndIdx, afterEndIdx + 10);
+        if (/^[.\/-]\d{1,2}[.\/-]\d{1,2}/.test(following) || /^\s*年/.test(following)) {
+          captured = yearTailMatch[1];
+        }
       }
     }
     return captured;
@@ -286,14 +365,16 @@ function extractVendorName(text) {
   var candidates = [];
 
   // パターン1: "〇〇株式会社" / "〇〇有限会社" など(法人格が後ろ)
-  var candRe = /(?:^|[\s、。\n])([^\s、。\n]{1,40}?(?:株式会社|有限会社|合同会社|（株）|\(株\)|K\.K\.|G\.K\.|Inc\.|LLC|Corporation|Corp\.))/g;
+  // 区切り文字に ・ / 記号類 を含めて途中で途切れるようにする
+  var sep = '\\s、。\\n・／/|｜';
+  var candRe = new RegExp('(?:^|[' + sep + '])([^' + sep + ']{1,40}?(?:株式会社|有限会社|合同会社|（株）|\\(株\\)|K\\.K\\.|G\\.K\\.|Inc\\.|LLC|Corporation|Corp\\.))', 'g');
   var m;
   while ((m = candRe.exec(text)) !== null) {
     candidates.push({ name: m[1].trim(), index: m.index });
   }
 
   // パターン2: "株式会社〇〇" など(法人格が先頭)
-  var preRe = /((?:株式会社|有限会社|合同会社)[^\s、。\n]{1,40})/g;
+  var preRe = new RegExp('((?:株式会社|有限会社|合同会社)[^' + sep + ']{1,40})', 'g');
   while ((m = preRe.exec(text)) !== null) {
     candidates.push({ name: m[1].trim(), index: m.index });
   }
@@ -401,11 +482,12 @@ function extractRecipientName(text) {
  * @return {string} 日付文字列 (yyyy/MM/dd) または空
  */
 function extractPaymentDueDate(text) {
+  // 具体的なラベルを先に、汎用の "Due" を最後に
   var labels = [
     '支払期日', '支払期限', 'お支払期日', 'お支払期限',
     '支払日', 'お支払日', '振込期限', '振込期日',
     '納期',
-    'Payment Due', 'Due Date', 'Pay By',
+    'Payment Due', 'Due Date', 'Pay By', 'Due',
   ];
 
   var lines = text.split('\n');
@@ -415,6 +497,11 @@ function extractPaymentDueDate(text) {
     for (var i = 0; i < lines.length; i++) {
       var labMatch = lines[i].match(labRe);
       if (!labMatch) continue;
+
+      // 英語ラベルが他の単語の一部になっていないか確認(Due が Reduced の一部等を回避)
+      var charBefore = labMatch.index > 0 ? lines[i].charAt(labMatch.index - 1) : '';
+      var charAfter = lines[i].charAt(labMatch.index + labMatch[0].length);
+      if (/[A-Za-z]/.test(charBefore) || /[A-Za-z]/.test(charAfter)) continue;
 
       // ラベル位置以降の同一行と次の行を結合して日付抽出
       var target = lines[i].substring(labMatch.index + labMatch[0].length);
@@ -509,7 +596,9 @@ function extractItems(normalized, original) {
     if (cellPerLine.length > 0) return cellPerLine;
     var colMajor = extractItemsColumnMajor(normalized);
     if (colMajor.length > 0) return colMajor;
-    return extractItemsInline(normalized);
+    var inlineItems = extractItemsInline(normalized);
+    if (inlineItems.length > 0) return inlineItems;
+    return extractItemsCrossPattern(normalized);
   }
 
   // ヘッダー以降の行をパース
@@ -557,7 +646,9 @@ function extractItems(normalized, original) {
     if (cellPerLine2.length > 0) return cellPerLine2;
     var colMajor2 = extractItemsColumnMajor(normalized);
     if (colMajor2.length > 0) return colMajor2;
-    return extractItemsInline(normalized);
+    var inline2 = extractItemsInline(normalized);
+    if (inline2.length > 0) return inline2;
+    return extractItemsCrossPattern(normalized);
   }
 
   return items;
@@ -622,6 +713,77 @@ function extractItemsInline(normalized) {
       unitPrice: parseNumber(m[4]),
       amount: amountNum,
     });
+  }
+
+  return items;
+}
+
+/**
+ * "品名 数量単位 × ¥単価" 形式の明細パーサー
+ *
+ * 例:
+ *   SaaS月額利用料 1月 × ¥248,000
+ *   初期セットアップ費用
+ *   1式 × ¥180,000     ← 直前の行が品名
+ *
+ * 金額は数量×単価で計算する(原文に明細金額の記載がないケース向け)
+ * @param {string} normalized
+ * @return {Object[]}
+ */
+function extractItemsCrossPattern(normalized) {
+  var items = [];
+  var lines = normalized.split('\n');
+  var pendingName = '';
+
+  // 単行完結: "名前 数量単位 × ¥単価"
+  var fullRe = /^(.+?)\s+(\d+(?:\.\d+)?)\s*([^\s\d×xX¥]{0,6})?\s*[×xX]\s*[¥￥]([\d,]+)/;
+  // 数量+単価のみ: "数量単位 × ¥単価"(直前行が名前)
+  var valueOnlyRe = /^\s*(\d+(?:\.\d+)?)\s*([^\s\d×xX¥]{0,6})?\s*[×xX]\s*[¥￥]([\d,]+)/;
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) { continue; }
+
+    // 打ち切りラベル(明細の下に現れる集計行)
+    // "請求先" "支払条件" など前部の見出しは除外し、具体的な集計ラベルのみ指定
+    if (/^(小計|合計|消費税|消費税額|税額|総額|総計|お振込|振込先|ご請求額|ご請求金額|お支払金額|Subtotal|Sub\s*Total|Grand\s*Total|Total\b|Tax\b)/i.test(line)) {
+      break;
+    }
+
+    var full = line.match(fullRe);
+    if (full) {
+      var qty = parseNumber(full[2]);
+      var price = parseNumber(full[4]);
+      items.push({
+        name: full[1].trim(),
+        quantity: qty,
+        unitPrice: price,
+        amount: qty * price,
+      });
+      pendingName = '';
+      continue;
+    }
+
+    var valueOnly = line.match(valueOnlyRe);
+    if (valueOnly && pendingName) {
+      var qty2 = parseNumber(valueOnly[1]);
+      var price2 = parseNumber(valueOnly[3]);
+      items.push({
+        name: pendingName,
+        quantity: qty2,
+        unitPrice: price2,
+        amount: qty2 * price2,
+      });
+      pendingName = '';
+      continue;
+    }
+
+    // 品名候補として保留(長すぎ/数字始まり/金額行は除外)
+    if (line.length >= 2 && line.length <= 60 &&
+        !/^[¥￥\d\-]/.test(line) &&
+        !/^(No\.?|Issue|Date|登録)/i.test(line)) {
+      pendingName = line;
+    }
   }
 
   return items;
@@ -839,9 +1001,17 @@ function extractAmount(text, label) {
       var afterLabel = lines[i].substring(labMatch.index + labMatch[0].length);
       var nums = collectAmountCandidates(afterLabel);
 
-      // 同一行で見つからない場合は次の行
-      if (nums.length === 0 && i + 1 < lines.length) {
-        nums = collectAmountCandidates(lines[i + 1]);
+      // 同一行で見つからない場合、後続3行まで空行スキップして探索
+      // 他の金額ラベル(小計/消費税/合計 等)が出現したらそこで打ち切り
+      // (別項目の値を誤取得しないため)
+      if (nums.length === 0) {
+        for (var k = i + 1; k < Math.min(i + 4, lines.length); k++) {
+          var nextLine = lines[k];
+          if (!nextLine.trim()) continue;  // 空行スキップ
+          if (isAnotherAmountLabel(nextLine)) break;
+          var nextNums = collectAmountCandidates(nextLine);
+          if (nextNums.length > 0) { nums = nextNums; break; }
+        }
       }
 
       // 最初に見つかった数値を返す(ラベルに最も近いもの)
@@ -903,6 +1073,15 @@ function collectAmountCandidates(line) {
     if (n > 0) amounts.push(n);
   }
   return amounts;
+}
+
+/**
+ * 行が別の金額ラベル行かを判定(extractAmount の値探索打ち切り用)
+ * @param {string} line
+ * @return {boolean}
+ */
+function isAnotherAmountLabel(line) {
+  return /(小計|消費税|税額|合計|総額|総計|ご請求|御請求|請求金額|Subtotal|Sub\s*Total|Grand\s*Total|Amount\s*Due|Total\b|Tax\b|VAT|GST)/i.test(line);
 }
 
 /**

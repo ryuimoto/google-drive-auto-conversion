@@ -13,21 +13,33 @@ function scanAndProcessFiles() {
     return;
   }
 
-  var processedCount = 0;
-  var maxFiles = CFG.processing.maxFilesPerExecution;
-
-  var files = getUnprocessedFiles(CFG.folders.upload);
-  for (var i = 0; i < files.length && processedCount < maxFiles; i++) {
-    var file = files[i];
-    var result = safeExecute(function() {
-      return processSingleFile(file);
-    }, 'process: ' + file.getName(), file.getName());
-
-    if (result) processedCount++;
+  // 前回実行が長引いて次のトリガーが重なると、同名フォルダを複数作成する競合が起きる。
+  // スクリプトロックで並行実行を防止(10秒以内にロックが取れなければスキップ)
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) {
+    console.log('他のトリガー実行中のためスキップ');
+    return;
   }
 
-  if (processedCount > 0) {
-    console.log('処理完了: ' + processedCount + ' ファイル');
+  try {
+    var processedCount = 0;
+    var maxFiles = CFG.processing.maxFilesPerExecution;
+
+    var files = getUnprocessedFiles(CFG.folders.upload);
+    for (var i = 0; i < files.length && processedCount < maxFiles; i++) {
+      var file = files[i];
+      var result = safeExecute(function() {
+        return processSingleFile(file);
+      }, 'process: ' + file.getName(), file.getName());
+
+      if (result) processedCount++;
+    }
+
+    if (processedCount > 0) {
+      console.log('処理完了: ' + processedCount + ' ファイル');
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -315,4 +327,77 @@ function findOrCreateLedger_(parentFolder) {
   var file = DriveApp.getFileById(ss.getId());
   file.moveTo(parentFolder);
   return file;
+}
+
+/**
+ * 処理済みフォルダ配下の同名サブフォルダ(請求書/注文書/契約書 等)を統合する
+ * 過去の重複実行や古いコードで作られた複数フォルダを1つにまとめ、
+ * 中身を全部最古のフォルダに集約し、空になった重複フォルダはゴミ箱に送る。
+ *
+ * 冪等: 重複がなければ何もしない。いつでも実行可能。
+ */
+function consolidateProcessedFolders() {
+  if (!CFG.folders.processed) {
+    console.error('CFG.folders.processed が未設定です。setup() を実行してください');
+    return;
+  }
+
+  console.log('===== 処理済みフォルダ統合開始 =====');
+  var processedRoot = DriveApp.getFolderById(CFG.folders.processed);
+
+  // 直下の全サブフォルダを名前でグルーピング
+  var foldersByName = {};
+  var iter = processedRoot.getFolders();
+  while (iter.hasNext()) {
+    var f = iter.next();
+    var name = f.getName();
+    if (!foldersByName[name]) foldersByName[name] = [];
+    foldersByName[name].push(f);
+  }
+
+  var mergedCount = 0;
+  for (var name in foldersByName) {
+    var group = foldersByName[name];
+    if (group.length <= 1) continue;
+
+    console.log('同名フォルダ「' + name + '」を ' + group.length + ' 個発見');
+
+    // 最初のフォルダを「正」とし、残りの中身を移動
+    var canonical = group[0];
+    for (var i = 1; i < group.length; i++) {
+      var dup = group[i];
+      mergeFolderContents_(dup, canonical);
+      dup.setTrashed(true);
+      mergedCount++;
+      console.log('  → 統合: ' + dup.getId() + ' を ' + canonical.getId() + ' に集約してゴミ箱へ');
+    }
+  }
+
+  console.log('===== 統合完了: ' + mergedCount + ' 個の重複フォルダを統合 =====');
+}
+
+/**
+ * source フォルダの中身(ファイル+サブフォルダ)を target フォルダへ再帰的にマージ
+ * 同名サブフォルダがあれば再帰的に統合、同名ファイルがあれば (2), (3)... で一意化
+ * @param {GoogleAppsScript.Drive.Folder} source
+ * @param {GoogleAppsScript.Drive.Folder} target
+ */
+function mergeFolderContents_(source, target) {
+  // ファイルを移動
+  var files = source.getFiles();
+  while (files.hasNext()) {
+    var file = files.next();
+    var uniqueName = ensureUniqueName(target, file.getName());
+    if (uniqueName !== file.getName()) file.setName(uniqueName);
+    file.moveTo(target);
+  }
+
+  // サブフォルダを再帰的にマージ
+  var subIter = source.getFolders();
+  while (subIter.hasNext()) {
+    var sub = subIter.next();
+    var targetSub = getOrCreateSubfolder(target, sub.getName());
+    mergeFolderContents_(sub, targetSub);
+    sub.setTrashed(true);
+  }
 }

@@ -221,6 +221,24 @@ function normalizeOcrText(text) {
  * @param {string} [flags] - 正規表現フラグ (例: 'i')
  * @return {RegExp}
  */
+/**
+ * 装飾スペース(1文字ずつ空白で区切られた区間)を検出して圧縮
+ * 例: "I S S U E  N o .  N X - 2 0 2 6 - 0 8 2 2" → "ISSUE No. NX-2026-0822"
+ *     "株 式 会 社 ネ ク ス ト イ ノ ベ ー シ ョ ン" → "株式会社ネクストイノベーション"
+ *
+ * 「1文字+空白」が4回以上連続する区間のみ圧縮するため、
+ * "is a test"(3連続) や "株 式 会 社" 単独(3連続) など通常の文章は壊さない
+ *
+ * @param {string} text
+ * @return {string}
+ */
+function decompactLetterSpacing(text) {
+  if (!text) return '';
+  return text.replace(/((?:[^\s\n]\s){4,}[^\s\n])/g, function(seg) {
+    return seg.replace(/[ \u3000]/g, '');
+  });
+}
+
 function buildSpacedLabelRegex(label, flags) {
   // ラベル内の空白は落とす("Amount Due" も "AmountDue" もマッチさせるため)
   var chars = label.split('').filter(function(ch) {
