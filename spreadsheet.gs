@@ -33,6 +33,11 @@ function appendToLedger(entry) {
   ];
 
   sheet.appendRow(row);
+
+  // 金額列（合計8, 小計9, 消費税10）をカンマ区切り表示に
+  var lastRow = sheet.getLastRow();
+  sheet.getRange(lastRow, 8, 1, 3).setNumberFormat('#,##0');
+
   console.log('台帳に追記: ' + entry.fileName +
               ' (' + entry.docType + ' / ' + (entry.vendor || '取引先未検出') +
               ' / ' + (entry.total || '金額未検出') + ')');

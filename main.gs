@@ -309,6 +309,9 @@ function findOrCreateLedger_(parentFolder) {
     sheet.setColumnWidth(i + 1, widths[i]);
   }
 
+  // 金額列（合計8, 小計9, 消費税10）はカンマ区切り表示
+  sheet.getRange('H2:J').setNumberFormat('#,##0');
+
   var file = DriveApp.getFileById(ss.getId());
   file.moveTo(parentFolder);
   return file;
