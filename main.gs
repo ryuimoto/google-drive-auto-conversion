@@ -232,6 +232,15 @@ function diagnose() {
     console.log('  有効: ' + stats.enabled);
     console.log('  APIキー設定: ' + (stats.hasKey ? '済' : '未'));
     console.log('  本日の呼び出し: ' + stats.count + ' / ' + stats.limit);
+    console.log('  本日のトークン消費: ' + stats.totalTokens.toLocaleString() +
+                ' (入力=' + stats.promptTokens.toLocaleString() +
+                ' / 出力=' + stats.outputTokens.toLocaleString() + ')');
+    console.log('  概算コスト: $' + stats.estimatedCostUsd.toFixed(6) +
+                ' (無料枠 ' + stats.limit + 'req/日 以内なら実コスト $0)');
+    if (stats.count > 0) {
+      var avgTokensPerCall = Math.round(stats.totalTokens / stats.count);
+      console.log('  1回あたり平均: ' + avgTokensPerCall.toLocaleString() + ' tokens');
+    }
     if (stats.enabled && !stats.hasKey) {
       console.log('  → API を有効化するには ScriptProperties の GEMINI_API_KEY にキーを設定してください');
       console.log('  → キー取得: https://aistudio.google.com/apikey (無料)');
@@ -282,6 +291,48 @@ function testGemini() {
   console.log('結果:');
   console.log(JSON.stringify(result, null, 2));
   console.log('===== Gemini テスト完了 =====');
+}
+
+/**
+ * このAPIキーで利用可能な Gemini モデル一覧を表示する
+ * 404/429 でモデル呼び出しが失敗した場合、この関数で実際に呼び出せるモデルを確認する
+ */
+function listGeminiModels() {
+  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) {
+    console.error('GEMINI_API_KEY が未設定です');
+    return;
+  }
+
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models?key=' + encodeURIComponent(apiKey);
+  var response;
+  try {
+    response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  } catch (e) {
+    console.error('ネットワークエラー: ' + e.message);
+    return;
+  }
+
+  var code = response.getResponseCode();
+  if (code !== 200) {
+    console.error('ListModels HTTP ' + code + ': ' + response.getContentText());
+    return;
+  }
+
+  var body = JSON.parse(response.getContentText());
+  var models = body.models || [];
+  var generative = models.filter(function(m) {
+    return (m.supportedGenerationMethods || []).indexOf('generateContent') >= 0;
+  });
+
+  console.log('===== 利用可能な Gemini モデル(' + generative.length + '件) =====');
+  generative.forEach(function(m) {
+    var shortName = m.name.replace(/^models\//, '');
+    console.log('  ' + shortName + '  (' + (m.displayName || '-') + ')');
+  });
+  console.log('');
+  console.log('現在の設定: ' + CFG.gemini.model);
+  console.log('上のリストから generateContent 対応モデルを選び、CFG.gemini.model に設定してください');
 }
 
 // ===== セットアップ支援 =====

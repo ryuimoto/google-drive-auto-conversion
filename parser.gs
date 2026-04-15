@@ -86,10 +86,13 @@ function parseInvoice(text) {
   //   戦略B: normalizeOcrText適用(全角区切り→改行、スペース縮約)
   //   戦略C: 装飾スペース(1文字単位空白区切り)を圧縮したバージョン
   // 全改行空白化の "flat" 戦略は extractAmount が口座番号等を誤検出するため不採用
+  var normalized = normalizeOcrText(text);
+  var decompacted = decompactLetterSpacing(normalized);
   var variants = [
     { name: 'raw',         text: text },
-    { name: 'normalized',  text: normalizeOcrText(text) },
-    { name: 'decompacted', text: decompactLetterSpacing(normalizeOcrText(text)) },
+    { name: 'normalized',  text: normalized },
+    { name: 'decompacted', text: decompacted },
+    { name: 'dedoubled',   text: dedoubleRepeatedChars(decompacted) },
   ];
 
   var best = null;
@@ -411,6 +414,23 @@ function extractInvoiceNumber(normalized, original) {
     return captured;
   }
 
+  // フォールバック: 文字間空白が 3 つ以下の "N O . PW- 2 0 2 6 - 0 7 1 6" 等は
+  // 通常の decompactLetterSpacing(閾値 4+)では圧縮されないため、閾値を 2+ に
+  // 下げた局所 decompact を施してから "N O ." パターンを試す。
+  // 強い decompact は単語境界を潰してしまうため、ここでは厳密な書類番号フォーマット
+  // (英字1-5 + 数字2+ + オプションの (-数字/英字) 繰り返し)で切り出す。
+  var localAggressive = normalized.replace(/((?:[^\s\n]\s){2,}[^\s\n])/g, function(seg) {
+    return seg.replace(/[ \u3000]/g, '');
+  });
+  if (localAggressive !== normalized) {
+    var strictCore = '[A-Z]{1,5}[-_]?\\d{2,}(?:[-_]\\d+)*';
+    var aggressiveRe = new RegExp('N\\s*O\\.\\s*(' + strictCore + ')', 'i');
+    var aggMatch = localAggressive.match(aggressiveRe);
+    if (aggMatch) {
+      return aggMatch[1];
+    }
+  }
+
   return '';
 }
 
@@ -429,6 +449,18 @@ function extractDate(normalized, original) {
     // スラッシュ・ハイフン・ドット区切り: 2024/01/15, 2024-01-15, 2024.01.15
     /(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/,
   ];
+
+  // 和暦(漢数字): 令和八年四月十六日
+  var kanjiReiwa = (normalized.match(/令和\s*([一二三四五六七八九十]+)\s*年\s*([一二三四五六七八九十]+)\s*月\s*([一二三四五六七八九十]+)\s*日/) ||
+                    original.match(/令和\s*([一二三四五六七八九十]+)\s*年\s*([一二三四五六七八九十]+)\s*月\s*([一二三四五六七八九十]+)\s*日/));
+  if (kanjiReiwa) {
+    var ky = parseKanjiNumeral(kanjiReiwa[1]);
+    var km = parseKanjiNumeral(kanjiReiwa[2]);
+    var kd = parseKanjiNumeral(kanjiReiwa[3]);
+    if (!isNaN(ky) && !isNaN(km) && !isNaN(kd)) {
+      return (2018 + ky) + '/' + km + '/' + kd;
+    }
+  }
 
   // 和暦パターン
   var reiwaMatch = normalized.match(patterns[0]) || original.match(patterns[0]);
@@ -507,7 +539,9 @@ function extractVendorName(text) {
   }
 
   // パターン2: "株式会社〇〇" など(法人格が先頭)
-  var preRe = new RegExp('(' + corpPat + '[^' + sep + ']{1,40})', 'g');
+  // 末尾オプション: スペース+カタカナ1〜5文字(OCRが "ネクストイノベーショ ン" と
+  // 末尾を分割した場合に再結合する。御中/様/殿は漢字なのでここでは吸収されない)
+  var preRe = new RegExp('(' + corpPat + '[^' + sep + ']{1,40}(?:\\s[\\u30A0-\\u30FF]{1,5})?)', 'g');
   while ((m = preRe.exec(text)) !== null) {
     candidates.push({ name: m[1].replace(/\s+/g, '').trim(), index: m.index });
   }
@@ -1317,6 +1351,13 @@ function parseGenericTable(text) {
  * @return {string} 'invoice' | 'table' | 'text'
  */
 function detectContentType(text) {
+  // 装飾で各文字が重複している場合("ごごせせいいききゅゅううししょょ" 等)に備えて
+  // dedouble 版でもキーワードマッチを試みる
+  var dedoubled = dedoubleRepeatedChars(text);
+  var matches = function(pattern) {
+    return pattern.test(text) || (dedoubled !== text && pattern.test(dedoubled));
+  };
+
   // 契約書固有のタイトル表記は他の書類名を本文中に含みがちなので最優先で判定
   // (例: "業務委託契約書" の中の "請求書受領後" が 'invoice' と誤判定されるのを防ぐ)
   var strongContractTitles = [
@@ -1325,7 +1366,7 @@ function detectContentType(text) {
     '簡易業務委託契約書', 'Service Agreement', 'Non-Disclosure Agreement', 'NDA',
   ];
   for (var si = 0; si < strongContractTitles.length; si++) {
-    if (buildSpacedLabelRegex(strongContractTitles[si], 'i').test(text)) {
+    if (matches(buildSpacedLabelRegex(strongContractTitles[si], 'i'))) {
       return 'contract';
     }
   }
@@ -1346,7 +1387,7 @@ function detectContentType(text) {
     var type = categories[c][0];
     var keywords = categories[c][1];
     for (var k = 0; k < keywords.length; k++) {
-      if (buildSpacedLabelRegex(keywords[k], 'i').test(text)) {
+      if (matches(buildSpacedLabelRegex(keywords[k], 'i'))) {
         return type;
       }
     }

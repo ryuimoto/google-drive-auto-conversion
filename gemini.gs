@@ -81,22 +81,50 @@ function extractInvoiceWithGemini(text) {
     },
   };
 
+  // 503/500/504 は一時的な過負荷なので指数バックオフでリトライ
+  var maxAttempts = 3;
   var response;
-  try {
-    response = UrlFetchApp.fetch(url, {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true,
-    });
-  } catch (e) {
-    console.error('[Gemini] ネットワークエラー: ' + e.message);
-    return null;
+  var code;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      response = UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true,
+      });
+    } catch (e) {
+      console.error('[Gemini] ネットワークエラー: ' + e.message);
+      return null;
+    }
+
+    code = response.getResponseCode();
+    if (code === 200) break;
+
+    var isTransient = (code === 503 || code === 500 || code === 504);
+    if (isTransient && attempt < maxAttempts) {
+      var waitMs = 1000 * Math.pow(2, attempt - 1); // 1秒 → 2秒 → 4秒
+      console.warn('[Gemini] HTTP ' + code + ' (一時的) 試行 ' + attempt + '/' + maxAttempts +
+                   ' → ' + waitMs + 'ms 待機後リトライ');
+      Utilities.sleep(waitMs);
+      continue;
+    }
+    break;
   }
 
-  var code = response.getResponseCode();
   if (code !== 200) {
     console.error('[Gemini] HTTP ' + code + ': ' + response.getContentText().substring(0, 500));
+    if (code === 404) {
+      console.error('  → モデル名が間違っているか、このAPIキーで利用できません');
+      console.error('  → listGeminiModels() を実行して利用可能なモデル一覧を確認してください');
+    } else if (code === 429) {
+      console.error('  → 無料枠を超過したか、このプロジェクトで無料枠が 0 です');
+      console.error('  → https://aistudio.google.com/apikey で「Create API key in new project」を選び、');
+      console.error('    新規プロジェクトでキーを再発行して GEMINI_API_KEY を上書きしてください');
+    } else if (code === 503 || code === 500 || code === 504) {
+      console.error('  → モデル側の一時的な過負荷です。数分後にもう一度試してください');
+      console.error('  → 頻発する場合は CFG.gemini.model を別モデル(例: gemini-2.5-flash-lite)に変更');
+    }
     return null;
   }
 
@@ -125,10 +153,17 @@ function extractInvoiceWithGemini(text) {
     return null;
   }
 
-  incrementGeminiCallCount_();
+  var usage = body.usageMetadata || {};
+  var promptTokens = usage.promptTokenCount || 0;
+  var outputTokens = usage.candidatesTokenCount || 0;
+  var totalTokens = usage.totalTokenCount || (promptTokens + outputTokens);
+
+  incrementGeminiCallCount_(totalTokens, promptTokens, outputTokens);
   console.log('[Gemini] 抽出成功: vendor=' + (parsed.vendorName || '-') +
               ' total=' + (parsed.total || 0) +
-              ' items=' + ((parsed.items && parsed.items.length) || 0));
+              ' items=' + ((parsed.items && parsed.items.length) || 0) +
+              ' tokens=' + totalTokens +
+              ' (prompt=' + promptTokens + ' / output=' + outputTokens + ')');
   return parsed;
 }
 
@@ -145,6 +180,9 @@ function canCallGeminiToday_() {
     props.setProperties({
       'GEMINI_COUNT_DAY': today,
       'GEMINI_COUNT': '0',
+      'GEMINI_TOKENS_TOTAL': '0',
+      'GEMINI_TOKENS_PROMPT': '0',
+      'GEMINI_TOKENS_OUTPUT': '0',
     });
     return true;
   }
@@ -154,12 +192,23 @@ function canCallGeminiToday_() {
 }
 
 /**
- * Gemini 呼び出し回数をインクリメント
+ * Gemini 呼び出し回数とトークン消費量をインクリメント
+ * @param {number} totalTokens
+ * @param {number} promptTokens
+ * @param {number} outputTokens
  */
-function incrementGeminiCallCount_() {
+function incrementGeminiCallCount_(totalTokens, promptTokens, outputTokens) {
   var props = PropertiesService.getScriptProperties();
   var count = parseInt(props.getProperty('GEMINI_COUNT') || '0', 10);
-  props.setProperty('GEMINI_COUNT', String(count + 1));
+  var total = parseInt(props.getProperty('GEMINI_TOKENS_TOTAL') || '0', 10);
+  var prompt = parseInt(props.getProperty('GEMINI_TOKENS_PROMPT') || '0', 10);
+  var output = parseInt(props.getProperty('GEMINI_TOKENS_OUTPUT') || '0', 10);
+  props.setProperties({
+    'GEMINI_COUNT': String(count + 1),
+    'GEMINI_TOKENS_TOTAL': String(total + (totalTokens || 0)),
+    'GEMINI_TOKENS_PROMPT': String(prompt + (promptTokens || 0)),
+    'GEMINI_TOKENS_OUTPUT': String(output + (outputTokens || 0)),
+  });
 }
 
 /**
@@ -170,13 +219,24 @@ function getGeminiStats() {
   var props = PropertiesService.getScriptProperties();
   var today = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
   var storedDay = props.getProperty('GEMINI_COUNT_DAY');
-  var count = (storedDay === today)
-    ? parseInt(props.getProperty('GEMINI_COUNT') || '0', 10)
-    : 0;
+  var isToday = (storedDay === today);
+  var count = isToday ? parseInt(props.getProperty('GEMINI_COUNT') || '0', 10) : 0;
+  var totalTokens = isToday ? parseInt(props.getProperty('GEMINI_TOKENS_TOTAL') || '0', 10) : 0;
+  var promptTokens = isToday ? parseInt(props.getProperty('GEMINI_TOKENS_PROMPT') || '0', 10) : 0;
+  var outputTokens = isToday ? parseInt(props.getProperty('GEMINI_TOKENS_OUTPUT') || '0', 10) : 0;
+
+  // gemini-2.0-flash 料金 (2026年4月時点): input $0.10 / 1M, output $0.40 / 1M
+  // 無料枠内なら実際のコストは $0
+  var estimatedCostUsd = (promptTokens * 0.10 + outputTokens * 0.40) / 1000000;
+
   return {
     count: count,
     limit: CFG.gemini.maxCallsPerDay,
     hasKey: !!props.getProperty('GEMINI_API_KEY'),
     enabled: CFG.gemini.enabled,
+    totalTokens: totalTokens,
+    promptTokens: promptTokens,
+    outputTokens: outputTokens,
+    estimatedCostUsd: estimatedCostUsd,
   };
 }

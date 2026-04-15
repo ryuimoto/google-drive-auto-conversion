@@ -50,10 +50,11 @@ const CFG = {
 
   // Gemini API 設定(正規表現パーサーの結果が不十分な場合のフォールバック)
   // API キーは ScriptProperties の GEMINI_API_KEY に手動設定する(未設定なら無効化)
-  // 無料枠: gemini-2.0-flash は 1日 1500 リクエストまで無料
+  // 無料枠: gemini-2.5-flash は 1日 1500 リクエストまで無料(2026年4月時点)
+  // 利用可能モデルは listGeminiModels() で確認できる
   gemini: {
     enabled: true,
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     maxCallsPerDay: 1400,   // 無料枠1500の90%で安全マージン
     scoreThreshold: 8,      // 正規表現パース結果の品質がこの値未満なら Gemini で救済
     timeoutMs: 30000,

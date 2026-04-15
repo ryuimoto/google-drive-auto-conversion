@@ -239,6 +239,46 @@ function decompactLetterSpacing(text) {
   });
 }
 
+/**
+ * "ごごせせいいききゅゅううししょょ" のように装飾で各文字が重複している範囲を
+ * 検出し、各文字を1つに圧縮する。同一文字ペアが3つ以上連続する箇所だけを対象とし、
+ * 自然文中の "ねえ" "ぱっぱっ" 等を誤って圧縮しない。
+ *
+ * 例: "ごごせせいいききゅゅううししょょ" → "ごせいきゅうしょ"
+ *     "おおきい" → "おおきい"(2ペア未満なので変化なし)
+ */
+function dedoubleRepeatedChars(text) {
+  if (!text) return '';
+  return text.replace(/(?:(.)\1){3,}/g, function(seg) {
+    return seg.replace(/(.)\1/g, '$1');
+  });
+}
+
+/**
+ * 漢数字を整数に変換する(日付用、1〜99 の範囲を想定)
+ * 対応: 零/〇/一〜九/十/十一〜十九/二十〜九十九
+ * 例: "八" → 8, "十六" → 16, "二十一" → 21
+ * 変換不能な場合は NaN を返す
+ */
+function parseKanjiNumeral(str) {
+  if (!str) return NaN;
+  var digitMap = { '零': 0, '〇': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  if (str.length === 1) {
+    if (str === '十') return 10;
+    return digitMap[str] !== undefined ? digitMap[str] : NaN;
+  }
+  var idx = str.indexOf('十');
+  if (idx >= 0) {
+    var tensPart = str.substring(0, idx);
+    var onesPart = str.substring(idx + 1);
+    var tens = (tensPart === '') ? 1 : digitMap[tensPart];
+    var ones = (onesPart === '') ? 0 : digitMap[onesPart];
+    if (tens === undefined || ones === undefined) return NaN;
+    return tens * 10 + ones;
+  }
+  return NaN;
+}
+
 function buildSpacedLabelRegex(label, flags) {
   // ラベル内の空白は落とす("Amount Due" も "AmountDue" もマッチさせるため)
   var chars = label.split('').filter(function(ch) {
