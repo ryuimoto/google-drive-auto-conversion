@@ -81,7 +81,8 @@ function extractInvoiceWithGemini(text) {
     },
   };
 
-  // 503/500/504 は一時的な過負荷なので指数バックオフでリトライ
+  // 503/500/504 は一時的な過負荷、429 はレート制限なのでリトライ
+  // 429 はエラーメッセージから "Please retry in Xs" を抽出して待機時間を決める
   var maxAttempts = 3;
   var response;
   var code;
@@ -102,9 +103,20 @@ function extractInvoiceWithGemini(text) {
     if (code === 200) break;
 
     var isTransient = (code === 503 || code === 500 || code === 504);
-    if (isTransient && attempt < maxAttempts) {
-      var waitMs = 1000 * Math.pow(2, attempt - 1); // 1秒 → 2秒 → 4秒
-      console.warn('[Gemini] HTTP ' + code + ' (一時的) 試行 ' + attempt + '/' + maxAttempts +
+    var isRateLimited = (code === 429);
+    if ((isTransient || isRateLimited) && attempt < maxAttempts) {
+      var waitMs;
+      if (isRateLimited) {
+        var bodyText = response.getContentText();
+        var retryMatch = bodyText.match(/retry in (\d+(?:\.\d+)?)s/i);
+        var retrySec = retryMatch ? parseFloat(retryMatch[1]) : 15;
+        // API指定の retry 値に +1秒の安全マージン
+        waitMs = Math.ceil((retrySec + 1) * 1000);
+      } else {
+        waitMs = 1000 * Math.pow(2, attempt - 1); // 1秒 → 2秒 → 4秒
+      }
+      console.warn('[Gemini] HTTP ' + code + ' (' + (isRateLimited ? 'レート制限' : '一時的') +
+                   ') 試行 ' + attempt + '/' + maxAttempts +
                    ' → ' + waitMs + 'ms 待機後リトライ');
       Utilities.sleep(waitMs);
       continue;

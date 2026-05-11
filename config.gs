@@ -44,6 +44,10 @@ const CFG = {
   ledger: {
     get spreadsheetId() { return _getProp(PROP_KEYS.ledger); },
     sheetName: '取引台帳',     // 台帳のタブ名
+    // ユーザー視点での取引先定義:
+    //  'issuer'   = 自社が請求書を発行する側(売掛・販売)。取引先=御中/様の宛先(顧客)
+    //  'receiver' = 自社が請求書を受け取る側(買掛・仕入)。取引先=発行元の社名
+    userRole: 'issuer',
   },
 
   // Gemini API 設定(正規表現パーサーの結果が不十分な場合のフォールバック)

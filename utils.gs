@@ -209,6 +209,10 @@ function normalizeOcrText(text) {
   var t = normalizeFullWidth(text);
   t = t.replace(/[／｜]/g, '\n');
   t = t.replace(/[ \u3000]{2,}/g, ' ');
+  // OCR\u304c "\u00a5245,455" \u3092 "\u00a5245, 455" \u306e\u3088\u3046\u306b 3\u6841\u533a\u5207\u308a\u30ab\u30f3\u30de\u306e\u76f4\u5f8c\u306b
+  // \u30b9\u30da\u30fc\u30b9\u3092\u5165\u308c\u3066\u5207\u308b\u30b1\u30fc\u30b9\u3092\u518d\u7d50\u5408\u3059\u308b\u30023\u6841\u3074\u3063\u305f\u308a + \u76f4\u5f8c\u304c\u6570\u5b57\u3067\u306a\u3044
+  // \u5834\u5408\u306b\u9650\u5b9a\u3057\u3001\u81ea\u7136\u6587 "\u5099\u80031, \u305d\u306e\u4ed6" \u306f\u58ca\u3055\u306a\u3044
+  t = t.replace(/(\d),\s+(\d{3})(?!\d)/g, '$1,$2');
   return t;
 }
 
@@ -260,6 +264,30 @@ function dedoubleRepeatedChars(text) {
  * 例: "八" → 8, "十六" → 16, "二十一" → 21
  * 変換不能な場合は NaN を返す
  */
+/**
+ * 金額抽出用に "明らかに金額ではない" 数字列をマスクする。
+ * これにより extractAmount の collectAmountCandidates が郵便番号や電話番号を拾わなくなる。
+ *
+ * マスク対象:
+ *  - 郵便番号:  〒XXX-XXXX
+ *  - 電話番号:  TEL/Phone/FAX/電話 + 数字-数字-数字
+ *  - 銀行口座:  普通預金/当座/口座番号 + 数字列
+ *  - 登録番号:  T+13桁(適格請求書)
+ *  - 日付:      YYYY/MM/DD, YYYY-MM-DD, YYYY年MM月DD日
+ *
+ * 行構造は維持し、数字部分のみ "___" に置換する。
+ */
+function maskNonAmountPatterns(text) {
+  if (!text) return '';
+  return text
+    .replace(/〒\s*\d{3}[-‐]?\d{4}/g, '〒___')
+    .replace(/(TEL|Tel|FAX|Fax|電話|Phone)[:：]?\s*[\d\-\s\(\)]+/gi, '$1:___')
+    .replace(/(普通預金|当座預金|口座番号)[:：]?\s*\d[\d\-\s]*/g, '$1:___')
+    .replace(/\bT\d{13}\b/g, 'T___')
+    .replace(/\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}/g, '___DATE___')
+    .replace(/\d{4}年\s*\d{1,2}月\s*\d{1,2}日/g, '___DATE___');
+}
+
 function parseKanjiNumeral(str) {
   if (!str) return NaN;
   var digitMap = { '零': 0, '〇': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };

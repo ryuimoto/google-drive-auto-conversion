@@ -152,6 +152,45 @@ function processManual(fileId) {
   console.log('手動処理完了');
 }
 
+/**
+ * Gemini API を呼び出さない (正規表現パースのみで完結) で関数を実行する
+ * 加えて通知メールも抑止する(GAS のメール送信は 100通/日 のクォータがあり、
+ * バッチ再処理では簡単に超えるため)
+ * @param {Function} fn
+ * @return {*}
+ */
+function withoutGemini_(fn) {
+  var savedGemini = CFG.gemini.enabled;
+  var savedNotify = CFG.notification.enabled;
+  CFG.gemini.enabled = false;
+  CFG.notification.enabled = false;
+  try {
+    return fn();
+  } finally {
+    CFG.gemini.enabled = savedGemini;
+    CFG.notification.enabled = savedNotify;
+  }
+}
+
+/**
+ * scanAndProcessFiles の Gemini 不使用版
+ * UPLOAD フォルダの未処理ファイルを処理するが、Gemini にはフォールバックしない。
+ * 通知メールも抑止する(大量処理時のメールクォータ超過対策)
+ */
+function scanAndProcessFilesNoGemini() {
+  console.log('Gemini 抑止モード(通知メールも抑止)で実行します');
+  withoutGemini_(scanAndProcessFiles);
+}
+
+/**
+ * processManual の Gemini 不使用版
+ * @param {string} fileId
+ */
+function processManualNoGemini(fileId) {
+  console.log('Gemini 抑止モード(通知メールも抑止)で手動処理します');
+  withoutGemini_(function() { processManual(fileId); });
+}
+
 // ===== トリガー管理 =====
 
 /**
@@ -223,6 +262,30 @@ function diagnose() {
     console.error('uploadフォルダにアクセスできません: ' + e.message);
   }
 
+  // 取引台帳の最近の OK 率(精度の定量化)
+  try {
+    var ledger = SpreadsheetApp.openById(CFG.ledger.spreadsheetId);
+    var sheet = ledger.getSheetByName(CFG.ledger.sheetName);
+    if (sheet) {
+      var lastRow = sheet.getLastRow();
+      var sampleSize = Math.min(50, lastRow - 1);
+      if (sampleSize > 0) {
+        // ステータス列(14列目)を末尾から取得
+        var statusCol = 14;
+        var values = sheet.getRange(lastRow - sampleSize + 1, statusCol, sampleSize, 1).getValues();
+        var okCount = 0;
+        for (var si = 0; si < values.length; si++) {
+          if (String(values[si][0]) === 'OK') okCount++;
+        }
+        var rate = (okCount / sampleSize * 100).toFixed(1);
+        console.log('');
+        console.log('[台帳精度] 直近 ' + sampleSize + ' 件の OK 率: ' + rate + '% (' + okCount + '/' + sampleSize + ')');
+      }
+    }
+  } catch (e) {
+    console.warn('台帳精度の取得失敗: ' + e.message);
+  }
+
   // Gemini 統計
   try {
     var stats = getGeminiStats();
@@ -290,6 +353,164 @@ function testGemini() {
   console.log('結果:');
   console.log(JSON.stringify(result, null, 2));
   console.log('===== Gemini テスト完了 =====');
+}
+
+/**
+ * 抽出精度の回帰テスト
+ *
+ * 台帳に誤記録された行の rawText 列を TEST_CASES に貼り付け、期待値を書く。
+ * Gemini を抑止した状態で parseLedgerEntry を呼び出し、各項目が期待通りに
+ * 取れるかを確認する。GASエディタから testParser() を直接実行する。
+ *
+ * ケース例:
+ *   {
+ *     name: '請求書#1',
+ *     text: '<台帳の rawText 列をそのままコピー>',
+ *     expect: {
+ *       vendor: '株式会社サンプル',
+ *       total: 110000,
+ *       subtotal: 100000,
+ *       tax: 10000,
+ *       issueDate: '2026/04/15',
+ *       docNumber: 'INV-2026-001',
+ *       docType: '請求書',
+ *     },
+ *   }
+ *
+ * expect に書いたキーのみ検証されるため、確認したい項目だけ指定すれば良い。
+ */
+var TEST_CASES = [
+  {
+    name: 'Row1: 合計が書類番号の数字を拾う',
+    text: '株式会社スカイ 御中 下記のとおりご請求申し上げます。 ご請求金額\n' +
+          'お支払期限：2026年05月25日\n' +
+          '2026年04月01日\n' +
+          '請求書番号: 20260403-2 請 求 書\n' +
+          '¥ 12,100 anono design 竹下菜生 登録番号: T8810710649516 anonodesign52@gmail.com 品目\n' +
+          '数量\n単価\n金額\n' +
+          'CTA画像作成費（2枚セット） 2 5,500 11,000\n' +
+          '小計 11,000\n' +
+          '消費税 (10%) 1,100\n' +
+          '合計 12,100',
+    expect: { vendor: '株式会社スカイ', total: 12100, subtotal: 11000, tax: 1100, issueDate: '2026/4/1', docNumber: '20260403-2' },
+  },
+  {
+    name: 'Row3: 御中なき宛名(冒頭+〒)、備考の他社名に騙されない',
+    text: '請求書\n' +
+          '株式会社スカイ \n' +
+          '〒150-0031 東京都渋谷区桜丘町1番2号\n' +
+          '渋谷サクラステージセントラルビル9階\n' +
+          '下記のとおりご請求申し上げます。 合計金額 ￥4,950- お支払い期限： 2026年4月末日\n' +
+          '請求日：2026年4月8日\n' +
+          '木山 彩花\n' +
+          'TEL:080-6921-0494 〒475-0918 愛知県半田市雁宿町3-203-4 パークサイド雁宿1-702 品名 数量 単価 金額\n' +
+          '2026/3/1 ショート動画作成 30 ¥50 ¥1500\n' +
+          '税(10%) ¥450 合計 ¥4950 備考 株式会社ラオルカ様より 2026年3月依頼分',
+    expect: { vendor: '株式会社スカイ', total: 4950 },
+  },
+  {
+    name: 'Row10: 一般社団法人プレフィックス',
+    text: '一般社団法人　お金の学校 様\n' +
+          '件名 : 3月度　Bコミさんプロジェクト報酬 下記のとおりご請求申し上げます。 請求書\n' +
+          '株式会社FIRE 〒4110022 静岡県三島市川原ケ谷\n' +
+          '62-3 2026年04月15日\n' +
+          '請求番号: 20260415-002 ご請求金額 ¥ 8,975',
+    expect: { vendor: '一般社団法人お金の学校', docNumber: '20260415-002' },
+  },
+  {
+    name: 'Row12: OCR で ¥X, YYY のスペース割れ',
+    text: '請　求　書\n' +
+          '株式会社スカイ 御中 DMS038 請求No. ご担当： 大塚　悠大 様 請求日\n' +
+          '件名： トレフル・エデュケーションラボ　田村幸仁 令和8年3月度業務委託費\n' +
+          '令和8年4月1日\n' +
+          'ご請求合計金額 ¥222, 672 （税込） お支払期限： 令和8年4月30日\n' +
+          'No. 摘要 数量 費用明細 単価 金額\n' +
+          '1 令和８年3月『負けないデイトレスクール』DMS、及び DMCサポート業務代として\n' +
+          '1 スクールサポート業 務一式 223,141 ¥223,141\n' +
+          '小計 ¥223,141\n' +
+          '消費税額（１０％対象) ¥22,314\n' +
+          'ご請求金額 ¥245, 455',
+    expect: { total: 245455, subtotal: 223141, tax: 22314 },
+  },
+  {
+    name: 'Row15: 複数行ラベル(小計\\n消費税 合計金額\\n値3つ)',
+    text: '請 求 書\n' +
+          '株式会社 スカイ 御中日付：2026年4月5日 請求書番号：INV-0000000030 所在地： 小西 歩\n' +
+          '下記のとおりご請求申し上げます。 合計金額 110,000円 (税込) 振込期限：2026年4月25日\n' +
+          '詳細 数量 単価 金額 2026年3月分報酬 1 100,000 100,000 備考： この度はご利用いただきありがとうございました。\n' +
+          '小計\n' +
+          '消費税 合計金額\n' +
+          '100,000 10,000 110,000',
+    expect: { vendor: '株式会社スカイ', subtotal: 100000, tax: 10000, total: 110000, issueDate: '2026/4/5' },
+  },
+  {
+    name: 'Row21: 多列ラベル「合計 税抜 消費税 総額」と 3 値',
+    text: '請 求 書\n' +
+          '〒150-0031 発行日： 2026/4/1(水) 東京都渋谷区桜丘町1番2号 お支払期限： 2026/4/30(木) 渋谷サクラステージ セントラ\n' +
+          '株式会社スカイ 御中 奥名　貴士 〒166-0003 ご請求金額 ¥220,000 (税込) 東京都杉並区 高円寺南2-41-10\n' +
+          '下記のとおりご請求申し上げます。 適格請求書発行事業者　登録番号： T9810103828081 品目 数量(時間) 金額（税別） 金額（税込） 備考\n' +
+          '【検定ビジネス案件】 1 カ月分 ¥200,000 ¥220,000 単価：200,000円/月（税別） PM業務 3月分\n' +
+          '合計 税抜 消費税 総額(税込) ¥200,000) ¥20,000) ¥220,000 振込先\n' +
+          '楽天銀行　ドラム支店',
+    expect: { subtotal: 200000, tax: 20000, total: 220000 },
+  },
+  {
+    name: 'Row22: 源泉徴収税額を消費税と取り違えない / Unicodeハイフン',
+    text: '株式会社スカイ 御中\n' +
+          '件名 : 2026年3月度デザイン制作費ご請求 下記のとおりご請求申し上げます。 請求書\n' +
+          'Tell Global Design Works 山本 朋実\n' +
+          '〒5100802 四日市市三ツ谷町4-22 2026年04月02日\n' +
+          '請求番号: 20260402‑001 ご請求金額 ¥ 50,000 - お支払い期限 : 2026年04月30日\n' +
+          'TEL: 080-6907-1614\n' +
+          'tomomi.araki.614y@gmail.com 品番・品名 数量 単価 金額\n' +
+          'ニュースレターデザインご対応費 1 55,685 55,685 小計 55,685 源泉徴収税額 -5,685 合計 50,000',
+    expect: { docNumber: '20260402-001', total: 50000, tax: 0 },
+  },
+  {
+    name: 'Row5: 差引請求額(源泉徴収後)を合計と取り違えない',
+    text: '3 月分 請求書\n' +
+          '株式会社スカイ　御中\n' +
+          '▼請求日： 2026/03/31 下記のとおり、ご請求もうしあげます。 ご請求金額合計 ¥4,092 ▼請求内容： ショート動画作業料一式\n' +
+          '・ 郵便番号： 940-2059 ▼振込先情報：\n' +
+          '作業料の内訳項目 数量 単価（税抜） 金額\n' +
+          'ショート動画作成 82 ¥50 ¥4,100\n' +
+          '作業料計（税抜） ¥4,100\n' +
+          '消費税額 ¥410\n' +
+          '合計（税込） ¥4,510\n' +
+          '源泉徴収税額 （適用税率： 10.21% ） ¥418\n' +
+          '差引請求額 ¥4,092',
+    expect: { total: 4510, tax: 410, subtotal: 4100 },
+  },
+];
+
+function testParser() {
+  if (!TEST_CASES || TEST_CASES.length === 0) {
+    console.log('TEST_CASES が空です。main.gs の TEST_CASES に rawText と期待値を追加してください');
+    return;
+  }
+
+  // Gemini を一時的に抑止(純粋な正規表現精度を測る)
+  var savedEnabled = CFG.gemini.enabled;
+  CFG.gemini.enabled = false;
+
+  var pass = 0, fail = 0;
+  try {
+    TEST_CASES.forEach(function(c) {
+      var result = parseLedgerEntry(c.text, c.fileName || 'test.pdf', 'http://test');
+      Object.keys(c.expect).forEach(function(k) {
+        var actual = result[k];
+        var expected = c.expect[k];
+        var ok = String(actual) === String(expected);
+        console.log((ok ? '✓' : '✗') + ' [' + c.name + '] ' + k +
+                    ': "' + actual + '" (期待: "' + expected + '")');
+        if (ok) pass++; else fail++;
+      });
+    });
+  } finally {
+    CFG.gemini.enabled = savedEnabled;
+  }
+
+  console.log('===== 結果: ' + pass + ' pass / ' + fail + ' fail =====');
 }
 
 /**

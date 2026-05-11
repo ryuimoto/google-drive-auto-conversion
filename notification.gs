@@ -55,13 +55,17 @@ function notifySuccess(fileName, outputFileId, outputType) {
     '<tr><td style="padding:4px 12px 4px 0"><b>リンク</b></td><td><a href="' + url + '">' + url + '</a></td></tr>' +
     '</table>';
 
-  MailApp.sendEmail({
-    to: recipient,
-    subject: subject,
-    htmlBody: htmlBody,
-  });
-
-  console.log('完了通知を送信: ' + recipient + ' (' + fileName + ')');
+  // メール送信失敗(クォータ超過など)で処理全体が止まらないように catch する
+  try {
+    MailApp.sendEmail({
+      to: recipient,
+      subject: subject,
+      htmlBody: htmlBody,
+    });
+    console.log('完了通知を送信: ' + recipient + ' (' + fileName + ')');
+  } catch (e) {
+    console.warn('完了通知の送信失敗(処理は継続): ' + e.message);
+  }
 }
 
 /**
@@ -87,13 +91,16 @@ function notifyError(fileName, errorMessage) {
     escapeHtml(errorMessage) +
     '</pre>';
 
-  MailApp.sendEmail({
-    to: recipient,
-    subject: subject,
-    htmlBody: htmlBody,
-  });
-
-  console.log('失敗通知を送信: ' + recipient + ' (' + fileName + ')');
+  try {
+    MailApp.sendEmail({
+      to: recipient,
+      subject: subject,
+      htmlBody: htmlBody,
+    });
+    console.log('失敗通知を送信: ' + recipient + ' (' + fileName + ')');
+  } catch (e) {
+    console.warn('失敗通知の送信失敗(処理は継続): ' + e.message);
+  }
 }
 
 /**
