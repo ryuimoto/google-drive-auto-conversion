@@ -190,8 +190,16 @@ function parseInvoiceOnce(normalized, original) {
   }
 
   // 小計が取れていない場合は明細合計で補完
+  // ただし明細合計が total に対して極端に小さい(2%未満かつ100円以上の差)場合は、
+  // 明細抽出が失敗している可能性が高いので採用しない(後で total-tax 逆算に委ねる)。
   if (!result.subtotal && itemsSum > 0) {
-    result.subtotal = itemsSum;
+    if (result.total > 0 && itemsSum < result.total * 0.5 && (result.total - itemsSum) > 100) {
+      console.warn('[items] itemsSum(' + itemsSum + ') が total(' + result.total +
+                   ') に対して極端に小さいため subtotal の補完をスキップ');
+      // skip — items 抽出が信頼できないケース(行連結や桁落ち)
+    } else {
+      result.subtotal = itemsSum;
+    }
   }
 
   // 合計-小計で消費税を逆算
@@ -212,12 +220,29 @@ function parseInvoiceOnce(normalized, original) {
   // 源泉徴収補正:
   //   原文に「源泉徴収」がある場合、'ご請求金額合計'/'差引請求額' などのラベルから
   //   源泉控除後の金額を total として拾った可能性が高い。
-  //   subtotal + taxAmount = gross total が成立するなら、それを total に採用する。
+  //   (1) 「合計（税込）/税込合計/総額（税込）」ラベルで直接 grossTotal を再探索する
+  //   (2) それでも取れず subtotal+taxAmount が成立するなら、それを total に採用する
   //   (例: subtotal=4100, tax=410, total=4092 → grossTotal=4510 に置換)
-  if (/源泉徴収/.test(normalized) && result.subtotal > 0 && result.taxAmount > 0) {
-    var grossTotal = result.subtotal + result.taxAmount;
-    if (result.total === 0 || (result.total < grossTotal && Math.abs(result.total - grossTotal) > 2)) {
-      result.total = grossTotal;
+  if (/源泉徴収/.test(normalized)) {
+    // (1) 直接ラベル探索 — 「合計（税込）」「税込合計」「総額（税込）」直後の金額
+    var grossLabelRe = /(?:税込\s*合計|合計\s*[\(（]\s*税込\s*[\)）]|総額\s*[\(（]\s*税込\s*[\)）])\s*[¥￥]?\s*([\d,]+)/;
+    var grossMatch = normalized.match(grossLabelRe);
+    if (grossMatch) {
+      var grossVal = parseNumber(grossMatch[1]);
+      if (grossVal > 0 && grossVal !== result.total) {
+        result.total = grossVal;
+        // subtotal/tax との整合性を回復(subtotal が逆算値だった場合に再算出)
+        if (result.taxAmount > 0 && Math.abs((result.subtotal || 0) + result.taxAmount - result.total) > 2) {
+          result.subtotal = result.total - result.taxAmount;
+        }
+      }
+    }
+    // (2) subtotal+tax 加算フォールバック
+    if (result.subtotal > 0 && result.taxAmount > 0) {
+      var grossTotal = result.subtotal + result.taxAmount;
+      if (result.total === 0 || (result.total < grossTotal && Math.abs(result.total - grossTotal) > 2)) {
+        result.total = grossTotal;
+      }
     }
   }
 
@@ -229,6 +254,46 @@ function parseInvoiceOnce(normalized, original) {
       /(内税|税込|内消費税|うち消費税|（税込）|\(税込\)|税込価格|税込合計|価格\s*\(税込\)|価格\s*（税込）)/.test(normalized) &&
       result.subtotal > result.taxAmount) {
     result.subtotal = result.total - result.taxAmount;
+  }
+
+  // うち消費税/内消費税 で tax が total と同値になるレイアウト補正:
+  //   "合計(税込) 129,300 11,755\nうち消費税\n129,300 11,755" のように、
+  //   「合計と内消費税を 2 値で並べる」レイアウトで、'うち消費税' ラベル直下の
+  //   行が複数値だった場合に、tax として第1値(=total と同じ値) を採用してしまうことがある。
+  //   このとき、同行内の第2値が tax の真の値なので置き換える。
+  if (result.total > 0 && result.taxAmount > 0 && result.taxAmount === result.total &&
+      /(うち消費税|内消費税)/.test(normalized)) {
+    var nlines = normalized.split('\n');
+    for (var ui = 0; ui < nlines.length; ui++) {
+      if (!/(うち消費税|内消費税)/.test(nlines[ui])) continue;
+      // 同一行末尾値 → 次行値 の順で複数値を探す
+      var candidateLine = '';
+      var labMatch = nlines[ui].match(/(うち消費税|内消費税)/);
+      var sameRest = nlines[ui].substring(labMatch.index + labMatch[0].length);
+      if (collectAmountCandidates(sameRest).length >= 2) {
+        candidateLine = sameRest;
+      } else {
+        for (var uj = ui + 1; uj < Math.min(ui + 3, nlines.length); uj++) {
+          if (!nlines[uj].trim()) continue;
+          if (collectAmountCandidates(nlines[uj]).length >= 2) {
+            candidateLine = nlines[uj];
+          }
+          break;
+        }
+      }
+      if (!candidateLine) continue;
+      var cnums = collectAmountCandidates(candidateLine);
+      if (cnums.length < 2) continue;
+      // 第1値が total と一致する場合、第2値を tax として採用
+      if (cnums[0].value === result.total && cnums[1].value > 0 && cnums[1].value < result.total) {
+        result.taxAmount = cnums[1].value;
+        // subtotal の整合性回復
+        if (Math.abs(result.subtotal + result.taxAmount - result.total) > 2) {
+          result.subtotal = result.total - result.taxAmount;
+        }
+        break;
+      }
+    }
   }
 
   return result;
@@ -533,6 +598,9 @@ function extractInvoiceNumber(normalized, original) {
     // 請求書系
     new RegExp('請求書番号[:：\\s]*(' + core + ')'),
     new RegExp('請求番号[:：\\s]*(' + core + ')'),
+    // 「請求書No.」「請求No.」(日英混在ラベル)
+    new RegExp('請求書\\s*No\\.?\\s*(' + core + ')', 'i'),
+    new RegExp('請求\\s*No\\.?\\s*(' + core + ')', 'i'),
     // Invoice No (英語請求書、decompact後に "INVOICENO" になるケース含む)
     new RegExp('\\bInvoice\\s*No\\.?\\s*(' + core + ')', 'i'),
     new RegExp('I\\s*n\\s*v\\s*o\\s*i\\s*c\\s*e\\s*N\\s*o\\.?[\\s　]*(' + core + ')', 'i'),
@@ -552,7 +620,12 @@ function extractInvoiceNumber(normalized, original) {
     // その他の書類番号
     new RegExp('伝票番号[:：\\s]*(' + core + ')'),
     new RegExp('契約番号[:：\\s]*(' + core + ')'),
-    // 汎用フォールバック(具体的なラベルでは取れなかった場合の最後の手段)
+    // № (U+2116 NUMERO SIGN) は和文請求書で書類番号ラベルとして使われる
+    new RegExp('№\\s*(' + core + ')'),
+  ];
+  // 汎用フォールバック (`No.` 等) は最後の手段として、明細行内の通し番号と
+  // 衝突しやすいため別ループで処理する
+  var fallbackPatterns = [
     // No. はドット必須(NOTE等の誤マッチ回避)。単語境界は付けない(OCRが
     // "I N V O I C ENo." のように直前の英字と結合するケースに対応するため)
     new RegExp('No\\.\\s*(' + core + ')', 'i'),
@@ -591,6 +664,10 @@ function extractInvoiceNumber(normalized, original) {
     // (例: "Invoice PASS" の "PASS" を拾ってしまうケース)
     if (!/\d/.test(match[1])) continue;
 
+    // 1〜2桁の純粋数字キャプチャは、明細の通し番号やページ番号 ("請求番号: 1") を
+    // 誤って書類番号として採用してしまうケースなので除外する
+    if (/^\d{1,2}$/.test(match[1].replace(/\s+/g, ''))) continue;
+
     var captured = match[1].replace(/\s+/g, '').trim();
 
     // 末尾が "/YYYY" または "/YYYY-MM-DD" / "/YYYY/MM/DD" / "/YYYY.MM.DD" の場合は
@@ -610,6 +687,33 @@ function extractInvoiceNumber(normalized, original) {
       }
     }
     return captured;
+  }
+
+  // 汎用フォールバック (`No.` / `No`) — 明細表の中の通し番号("No.41-45" 等)を
+  // 拾わないよう、マッチ位置の行が明細行(¥/￥ や複数の数値トークンを含む)である場合はスキップ
+  for (var fi = 0; fi < fallbackPatterns.length; fi++) {
+    var sources = [normalized, original];
+    for (var si = 0; si < sources.length; si++) {
+      var src = sources[si];
+      var fp = new RegExp(fallbackPatterns[fi].source, fallbackPatterns[fi].flags.replace('g', '') + 'g');
+      var fm;
+      while ((fm = fp.exec(src)) !== null) {
+        if (!/\d/.test(fm[1])) continue;
+        // マッチ行を取得
+        var lineStart = src.lastIndexOf('\n', fm.index) + 1;
+        var lineEnd = src.indexOf('\n', fm.index);
+        if (lineEnd === -1) lineEnd = src.length;
+        var lineText = src.substring(lineStart, lineEnd);
+        // 明細行判定: ¥/￥が含まれる、または "数量"/"単価"/"金額" 等のヘッダ語が含まれる、
+        // または同行に長い金額数値(>=3 digit)が2つ以上ある
+        var hasYen = /[¥￥]/.test(lineText);
+        var hasItemKeyword = /(数量|単価|金額|摘要|品名|品目|Description|Qty|Amount|Price)/i.test(lineText);
+        var bigNumMatches = lineText.match(/\d{3,}/g) || [];
+        if (hasYen || hasItemKeyword || bigNumMatches.length >= 2) continue;
+        var capF = fm[1].replace(/\s+/g, '').trim();
+        if (capF) return capF;
+      }
+    }
   }
 
   // フォールバック: 文字間空白が 3 つ以下の "N O . PW- 2 0 2 6 - 0 7 1 6" 等は
@@ -639,6 +743,12 @@ function extractInvoiceNumber(normalized, original) {
  * @return {string}
  */
 function extractDate(normalized, original) {
+  // 「発行日」「請求日」「日付」など発行日ラベル直後の日付を最優先で探索
+  // (同一テキスト内に「ご請求日 2026/3/31 発行日 2026/4/1」のように複数日付がある場合に、
+  //  単純な前方一致だと 請求日 を採用してしまうため、発行日を最優先する)
+  var issuePriority = findDateAfterIssueLabel_(normalized, original);
+  if (issuePriority) return issuePriority;
+
   var patterns = [
     // 和暦: 令和6年1月15日
     /令和\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日/,
@@ -691,6 +801,73 @@ function extractDate(normalized, original) {
     }
   }
 
+  return '';
+}
+
+/**
+ * 「発行日」「請求日」「日付」「作成日」等のラベル直後 40文字以内に出現する日付を、
+ * テキスト全体で最も「発行日寄り」のものを優先して返す。
+ * 優先順: 発行日 > 請求日 > 日付/作成日/年月日 > Date/Issued/Issue
+ *
+ * 同一ドキュメントに「ご請求日 X 発行日 Y お支払期限 Z」のように複数の日付ラベルがある場合、
+ * 単純な前方走査だと先頭の「請求日」を採用してしまうので、ラベルの優先度を反映する。
+ *
+ * 「ご請求日」は「請求日」の前に「ご」が付いているが、findShortDateNearLabel 内部で
+ * spacedLabel として処理されるためマッチには影響しない(部分一致で取れる)。
+ *
+ * @return {string} "YYYY/MM/DD" または空
+ */
+function findDateAfterIssueLabel_(normalized, original) {
+  // 優先度高い → 低い の順
+  var labels = ['発行日', '請求日', '日付', '作成日', '年月日'];
+  var sources = [normalized];
+  if (original && original !== normalized) sources.push(original);
+  for (var li = 0; li < labels.length; li++) {
+    var labRe = buildSpacedLabelRegex(labels[li], 'i');
+    for (var si = 0; si < sources.length; si++) {
+      var src = sources[si];
+      var globalRe = new RegExp(labRe.source, labRe.flags.indexOf('g') === -1 ? labRe.flags + 'g' : labRe.flags);
+      var m;
+      while ((m = globalRe.exec(src)) !== null) {
+        // ラベル直後 40文字以内を slice して日付を探す
+        var sliceStart = m.index + m[0].length;
+        var slice = src.substring(sliceStart, Math.min(src.length, sliceStart + 40));
+        var ymd = _tryExtractYmdFromSlice_(slice);
+        if (ymd) return ymd;
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * 短いテキストスライスから最初の妥当な日付(西暦/和暦/区切り)を抽出。
+ * OCR で「2 0 2 6年4月5日」のように数字間に空白が入った場合に備え、
+ * スライス内の連続数字スペース割れを先に圧縮する。
+ */
+function _tryExtractYmdFromSlice_(slice) {
+  // 連続する「数字+空白」を圧縮("2 0 2 6 年" → "2026 年"、"0 0 3 0" → "0030")。
+  // 自然文 "is 2 dollars" のような誤圧縮を避けるため、空白を挟んで隣接する数字が
+  // 2回以上連続する場合のみを対象にする。
+  var compacted = slice.replace(/\d(?:[ 　]+\d){1,}/g, function(seg) {
+    return seg.replace(/[ 　]+/g, '');
+  });
+  // 西暦 (年月日 漢字)
+  var m = compacted.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+  if (m && isValidYmd_(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10))) {
+    return parseInt(m[1], 10) + '/' + parseInt(m[2], 10) + '/' + parseInt(m[3], 10);
+  }
+  // 和暦
+  m = compacted.match(/令和\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日/);
+  if (m) {
+    var y = 2018 + parseInt(m[1], 10), mm = parseInt(m[2], 10), dd = parseInt(m[3], 10);
+    if (isValidYmd_(y, mm, dd)) return y + '/' + mm + '/' + dd;
+  }
+  // スラッシュ・ハイフン・ドット
+  m = compacted.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
+  if (m && isValidYmd_(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10))) {
+    return parseInt(m[1], 10) + '/' + parseInt(m[2], 10) + '/' + parseInt(m[3], 10);
+  }
   return '';
 }
 
@@ -869,10 +1046,94 @@ function extractRecipientName(text) {
                 '学\\s?校\\s?法\\s?人|医\\s?療\\s?法\\s?人|宗\\s?教\\s?法\\s?人|社\\s?会\\s?福\\s?祉\\s?法\\s?人|' +
                 '（株）|\\(株\\)';
 
-  // パターン0: 冒頭(最初の8行)に「会社名行 + 直後に 〒XXX-XXXX で始まる行」がある
-  // 請求書レイアウト用 — 御中/様 がなくても請求書の宛名は冒頭にあるという慣例を活用。
-  // 「備考 株式会社ラオルカ様より」のような後段の他社名に騙されないよう最優先で試す。
-  // 例: "請求書\n株式会社スカイ\n〒150-0031..."
+  // 1行から「corp を含む社名のみ」を切り出すヘルパー。
+  // 「№ H2026-03-09 株式会社スカイ　御中 登録番号」→「株式会社スカイ」
+  // 「XYZ株式会社」→「XYZ株式会社」
+  // 御中/様/殿サフィックスは剥がす。長さ 2-40 でない場合は null を返す。
+  function extractCorpNameFromLine_(line) {
+    if (!line) return null;
+    // パターンA: corp が先頭 + 最大30文字の社名サフィックス
+    var reA = new RegExp('((?:' + corpAlt + ')[^\\s、。・/／|｜\\n]{0,30})');
+    // パターンB: 1〜25文字の社名プレフィックス + corp
+    var reB = new RegExp('([^\\s、。・/／|｜\\n]{1,25}(?:' + corpAlt + '))');
+    // どちらか先にマッチする方を採用(A 優先 = 法人格先頭が多い日本企業)
+    var matchA = line.match(reA);
+    var matchB = line.match(reB);
+    var pick = null;
+    if (matchA && matchB) {
+      pick = matchA.index <= matchB.index ? matchA[1] : matchB[1];
+    } else {
+      pick = matchA ? matchA[1] : (matchB ? matchB[1] : null);
+    }
+    if (!pick) return null;
+    var cleaned = pick.replace(/\s+/g, '').trim();
+    cleaned = cleaned.replace(/(御中|様|さま|殿)+$/, '').trim();
+    if (cleaned.length < 2 || cleaned.length > 40) return null;
+    if (INVALID_HONOR_TARGETS.test(cleaned)) return null;
+    return cleaned;
+  }
+
+  // パターン1: 御中/様マッチを line ごとに走査(最優先 — 宛先指定が最も確度の高いシグナル)
+  // 「備考」セクションは除外、書類タイトル(請求書/見積書 等)も除外
+  var lines = text.split('\n');
+  for (var li2 = 0; li2 < lines.length; li2++) {
+    var ln = lines[li2];
+    if (/(備考|備　考|Notes?|Remarks?|参考|注意)/i.test(ln)) continue;
+    // パターンA: corp が先頭 (例: 株式会社スカイ 御中)
+    var reA = new RegExp('((?:' + corpAlt + ')[^、。\\n・/／|｜]{0,30})\\s*(?:御中|様|さま|殿)');
+    var matchA = ln.match(reA);
+    if (matchA) {
+      var nameA = matchA[1].replace(/\s+/g, '').trim();
+      if (nameA && !INVALID_HONOR_TARGETS.test(nameA)) return nameA;
+    }
+    // パターンB: corp が末尾 (例: XYZ株式会社 御中)
+    var reB = new RegExp('([^\\s、。\\n・/／|｜]{1,25}(?:' + corpAlt + '))\\s*(?:御中|様|さま|殿)');
+    var matchB = ln.match(reB);
+    if (matchB) {
+      var nameB = matchB[1].replace(/\s+/g, '').trim();
+      if (nameB && !INVALID_HONOR_TARGETS.test(nameB)) return nameB;
+    }
+  }
+
+  // パターン1b: 法人格を持たない屋号/個人名向け(行内シンプル敬称マッチ)
+  // 書類タイトル「御請求書」「ご請求書」は除外。
+  // 備考セクション内の他社名(例: "備考 株式会社ラオルカ様より")を拾わないよう、
+  // マッチ位置と同一行内の直前テキストに 備考/Notes/参考/注意 があればスキップする
+  var honorMatchRe = /([^\s、。\n]+?)\s*(?:御中|様|さま|殿)/g;
+  var hm;
+  while ((hm = honorMatchRe.exec(text)) !== null) {
+    var name = hm[1].trim();
+    if (!name || INVALID_HONOR_TARGETS.test(name.replace(/\s/g, ''))) continue;
+    // 同一行内の直前に 備考 等があれば、備考セクションの他社名なのでスキップ
+    var lineStart = text.lastIndexOf('\n', hm.index) + 1;
+    var precedingInLine = text.substring(lineStart, hm.index);
+    if (/(備考|備　考|Notes?|Remarks?|参考|注意)/i.test(precedingInLine)) continue;
+    return name;
+  }
+
+  // パターン2: 宛先ラベルの次の行(英日混在レイアウト)
+  var labels = ['宛先', '注文先', '請求先', '発注先', 'BILL TO', 'BILLTO', 'BUYER', 'TO'];
+  for (var li = 0; li < labels.length; li++) {
+    var labRe = buildSpacedLabelRegex(labels[li], 'i');
+    for (var i = 0; i < lines.length; i++) {
+      if (!labRe.test(lines[i])) continue;
+      var afterMatch = lines[i].match(labRe);
+      var rest = lines[i].substring(afterMatch.index + afterMatch[0].length).trim();
+      if (rest.length >= 2 && rest.length <= 40 && !/^[:：]/.test(rest)) {
+        return rest.replace(/^[:：\s]+/, '').trim();
+      }
+      for (var j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        var candidate = lines[j].trim();
+        if (candidate.length >= 2 && candidate.length <= 40) {
+          return candidate;
+        }
+      }
+    }
+  }
+
+  // パターン3: 御中/様が無いレイアウト用 — 冒頭(最初の12行)で「会社名行 + 直後に 〒XXX-XXXX」
+  // ここまで Pattern 1/1b/2 で 御中/様/宛先ラベルがマッチしなかった場合のみ実行する。
+  // (発行元の corp+〒 を宛先として誤採用するのを避けるため、敬称マッチを最優先)
   var headLines = text.split('\n').slice(0, 12);
   var corpLineRe = new RegExp('(?:' + corpAlt + ')');
   for (var hl = 0; hl < headLines.length - 1; hl++) {
@@ -883,60 +1144,21 @@ function extractRecipientName(text) {
       var nextLine = headLines[nx].trim();
       if (!nextLine) continue;
       if (/^〒\s*\d{3}/.test(nextLine)) {
-        // 行内から法人格を含む社名のみを切り出す(「株式会社スカイ」「ABC株式会社」両対応)
-        // 行全体が短ければそのまま社名とみなす
-        var hv = line.replace(/\s+/g, '').trim();
-        if (hv && hv.length <= 40 && !INVALID_HONOR_TARGETS.test(hv)) return hv;
+        // 行内から corp を含む社名のみ切り出す(行頭の番号やトレイラ御中を除去)
+        var hv = extractCorpNameFromLine_(line);
+        if (hv) return hv;
       }
       break;
     }
   }
 
-  // パターン1a: 法人格を含む長めのマッチを先に試す
-  // 「合同会社XYZ 様」「株式会社サンプル 御中」が「会社」だけにならないようにする
-  // 法人格は OCR で内部にスペースが入っても許容、trailing 部分はスペース1個まで許容
-  // (「株式会社 スカイ 御中」→「株式会社スカイ」)
-  var corpHonorRe = new RegExp('([^、。\\n]{0,40}?(?:' + corpAlt + ')[^、。\\n]{0,40})\\s*(?:御中|様|さま|殿)', 'g');
-  var cm;
-  while ((cm = corpHonorRe.exec(text)) !== null) {
-    var raw = cm[1];
-    // 「備考」「Notes」セクションの会社名は宛先ではないので除外
-    if (/(備考|備　考|Notes?|Remarks?|参考|注意)/i.test(raw)) continue;
-    var candName = raw.replace(/\s+/g, '').trim();
-    if (candName && !INVALID_HONOR_TARGETS.test(candName)) return candName;
-  }
-
-  // パターン1b: 敬称直前の会社名/個人名(法人格を持たない屋号や個人名向け)
-  // 書類タイトル「御請求書」「ご請求書」は除外する(タイトル直後に「御中」が来る OCR レイアウト対策)
-  var honorMatchRe = /([^\s、。\n]+?)\s*(?:御中|様|さま|殿)/g;
-  var hm;
-  while ((hm = honorMatchRe.exec(text)) !== null) {
-    var name = hm[1].trim();
-    if (!name || INVALID_HONOR_TARGETS.test(name.replace(/\s/g, ''))) continue;
-    return name;
-  }
-
-  // パターン2: 宛先ラベルの次の行(英日混在レイアウト)
-  var labels = ['宛先', '注文先', '請求先', '発注先', 'BILL TO', 'BILLTO', 'BUYER', 'TO'];
-  var lines = text.split('\n');
-  for (var li = 0; li < labels.length; li++) {
-    var labRe = buildSpacedLabelRegex(labels[li], 'i');
-    for (var i = 0; i < lines.length; i++) {
-      if (!labRe.test(lines[i])) continue;
-      // ラベル以降の同一行に名前があるか
-      var afterMatch = lines[i].match(labRe);
-      var rest = lines[i].substring(afterMatch.index + afterMatch[0].length).trim();
-      if (rest.length >= 2 && rest.length <= 40 && !/^[:：]/.test(rest)) {
-        return rest.replace(/^[:：\s]+/, '').trim();
-      }
-      // 同一行に名前がなければ次の非空行を返す
-      for (var j = i + 1; j < Math.min(i + 3, lines.length); j++) {
-        var candidate = lines[j].trim();
-        if (candidate.length >= 2 && candidate.length <= 40) {
-          return candidate;
-        }
-      }
-    }
+  // パターン4: 御中/様マッチも ヘッダパターン(corp+〒)も失敗のとき、
+  // 冒頭 6行に出現する最初の corp パターンを宛先とする(OCRで御中位置が崩れたケース対策)
+  // 例: "株式会社SKY ... \n御請求書\n御中 株式会社SIX" の OCR で 御中 が corp の前にあるケース
+  var earlyLines = text.split('\n').slice(0, 6);
+  for (var el = 0; el < earlyLines.length; el++) {
+    var ec = extractCorpNameFromLine_(earlyLines[el]);
+    if (ec) return ec;
   }
 
   return '';
@@ -1514,6 +1736,13 @@ function extractAmountWithConfidence(text, label) {
 
       if (/^[\s:：]*(Rate|rate|RATE|率)/.test(afterLabel)) continue;
       if (lab === '税' && /^[込別率]/.test(afterLabel)) continue;
+      // "税込合計金額 内税" のように複合ラベルや「合計金額 内税」のように直後が
+      // 修飾子で値が無いヘッダ行はスキップ。afterLabel の最初の 30 文字以内に
+      // 内税/税込/外税/税抜 等の修飾子が出現し、かつそれより前に数字・¥が無ければ
+      // 「ラベル+修飾子のみのヘッダ行」とみなして次の variant / 次の行へ進む。
+      var headPart = afterLabel.substring(0, 30);
+      var modMatch = headPart.match(/(内税|税込|外税|税抜|内消費税|うち消費税)/);
+      if (modMatch && !/[\d¥￥]/.test(headPart.substring(0, modMatch.index))) continue;
 
       excludedLines[i] = true;
       var nums = collectAmountCandidates(afterLabel);
@@ -1522,6 +1751,11 @@ function extractAmountWithConfidence(text, label) {
       if (!hasYenValue(nums)) {
         var fallbackNums = nums;
         var fallbackSource = nums.length > 0 ? 'sameLine' : null;
+        // 「金額の値が来ない」ことが明白なラベルだけの行(振込先/銀行名/税込価格 等)が
+        // ラベル直後に出現する場合は、その時点で前方探索を打ち切る。
+        // (例: Six請求書 "消費税\n税込価格\nお振り込み先\n合 計\n\\936,643" で
+        //  消費税が遠方の合計値 936,643 を tax として誤拾するのを防ぐ)
+        var DEAD_END_LINE_RE = /^[\s:：]*(税込価格|税抜価格|お振り?込み?先|振込先|代金振込先|金融機関|銀行名|支店名|口座(?:番号|名義|種別)?|備考)\s*$/;
         // window: 最大6行先まで見るが、マスク後に空になる行(日付/電話)は budget を消費しない。
         // productive な行(候補ありの行)が 3 を越えたら打ち切り。
         // これにより「ご請求金額\nお支払期限:...\n2026年04月01日\n請求書番号: 20260403-2\n¥12,100」
@@ -1530,12 +1764,14 @@ function extractAmountWithConfidence(text, label) {
         for (var k = i + 1; k < Math.min(i + 7, lines.length) && productive < 3; k++) {
           var nextLine = lines[k];
           if (!nextLine.trim()) continue;
+          if (DEAD_END_LINE_RE.test(nextLine.trim())) break;
           if (isAnotherAmountLabel(nextLine)) break;
           var nextNums = collectAmountCandidates(nextLine);
           if (nextNums.length === 0) continue;
           productive++;
           if (hasYenValue(nextNums)) { nums = nextNums; source = 'nextLine'; break; }
-          if (!hasYenValue(fallbackNums)) { fallbackNums = nextNums; fallbackSource = 'nextLine'; }
+          // fallback は「最初に見つかった非¥候補」を保持。以降の行で上書きしない
+          if (fallbackNums.length === 0) { fallbackNums = nextNums; fallbackSource = 'nextLine'; }
         }
         if (!hasYenValue(nums) && fallbackNums.length > 0) {
           nums = fallbackNums;
@@ -1601,12 +1837,15 @@ function getAmountLabelVariants(label) {
 function collectAmountCandidates(line) {
   var amounts = [];
   // ¥記号(前)・円/JPYサフィックス(後)・%付き(税率)のいずれもキャプチャ
-  // 円/JPY サフィックスがあれば「金額」と確信できるので hasYen 相当の信頼として扱う
-  var re = /([¥￥])?\s*([\d,]+)\s*(円|JPY|jpy)?(\s*[%％])?/g;
+  // 円/JPY サフィックスがあれば「金額」と確信できるので hasYen 相当の信頼として扱う。
+  // OCR で "¥245, 455" のように 3桁区切りカンマの直後にスペースが入って分断するケースに
+  // 対応するため、桁区切りグループ(`,\s?\d{3}`)を許容する。
+  var re = /([¥￥])?\s*(\d{1,3}(?:,[ 　]?\d{3})*|\d+)\s*(円|JPY|jpy)?(\s*[%％])?/g;
   var m;
   while ((m = re.exec(line)) !== null) {
     if (m[4]) continue;  // % 付き → 税率
-    var n = parseNumber(m[2]);
+    // カンマ直後のスペースを除去してから parseNumber
+    var n = parseNumber(m[2].replace(/\s+/g, ''));
     // 1億円以上は実質的に書類番号(8桁以上の連続数字)等のノイズなので除外。
     // ¥付きでも除外する(¥20260403 のような OCR 連結ケース対策)
     if (n > 0 && n < 100000000) amounts.push({ value: n, hasYen: !!m[1] || !!m[3] });
@@ -1686,6 +1925,15 @@ function extractAmountTriplet_(text) {
 
   for (var i = 0; i < lines.length - 1; i++) {
     var labels = collectLabels(lines[i]);
+
+    // インターリーブ・レイアウト(同一行に "ラベル値 ラベル値 ラベル値" のように交互に並ぶ)
+    // を最優先で検出する。例: "消費税 50,000 合計 550,000 内訳 10%対象額 500,000"
+    // この場合、各ラベルの直後の最初の値をペアリングする。
+    if (labels.length >= 2) {
+      var interleaved = parseInterleavedLabelValue_(lines[i]);
+      if (interleaved) return interleaved;
+    }
+
     // 前行が「ラベルのみの短い行」(例: 単独 "小計")なら現行のラベルと結合する。
     // これにより "小計\n消費税 合計金額\n100,000 10,000 110,000" のような
     // 多行ラベルレイアウトも 1 セットとして扱える。
@@ -1747,6 +1995,62 @@ function extractAmountTriplet_(text) {
     }
     if (matched) break;
   }
+  return null;
+}
+
+/**
+ * インターリーブ「ラベル 値 ラベル 値 ...」レイアウトを1行から抽出する。
+ *
+ * 例: "消費税 50,000 合計 550,000 内訳 10%対象額 500,000"
+ *     → { subtotal: 0, taxAmount: 50000, total: 550000 }
+ *
+ * 各ラベルの直後(次のラベル位置の手前まで)の最初の数値をそのラベルの値とする。
+ * 各ラベル間に値が見つからない場合はそのラベルをスキップ。
+ * subtotal/tax/total いずれかが取れていれば返す、なければ null。
+ *
+ * @param {string} line
+ * @return {{subtotal:number, taxAmount:number, total:number}|null}
+ */
+function parseInterleavedLabelValue_(line) {
+  if (!line) return null;
+  var labelRe = /(小計|税抜合計|税抜金額|税抜|消費税額等|消費税額|消費税等|消費税|税額|税込合計|税込|総額|総計|合計金額|合計|ご請求金額|御請求金額|ご請求額|請求金額)/g;
+  var positions = [];
+  var lm;
+  labelRe.lastIndex = 0;
+  while ((lm = labelRe.exec(line)) !== null) {
+    var prevCh = lm.index > 0 ? line.charAt(lm.index - 1) : '';
+    if ((lm[1] === '税込' || lm[1] === '税抜') && (prevCh === '(' || prevCh === '（')) continue;
+    positions.push({ label: lm[1], start: lm.index, end: lm.index + lm[0].length });
+  }
+  if (positions.length < 2) return null;
+
+  // 値が「ラベルの直後の数字」として現れているか(=インターリーブ)を確認。
+  // 最初のラベル直後 30文字以内に数字があれば インターリーブと判定する。
+  var firstLabelEnd = positions[0].end;
+  var firstSlice = line.substring(firstLabelEnd, Math.min(line.length, firstLabelEnd + 30));
+  if (!/[¥￥]?\s*[\d,]+/.test(firstSlice)) return null;
+
+  var result = { subtotal: 0, taxAmount: 0, total: 0 };
+  var filled = 0;
+  for (var pi = 0; pi < positions.length; pi++) {
+    var labelEnd = positions[pi].end;
+    var sliceEnd = (pi + 1 < positions.length) ? positions[pi + 1].start : line.length;
+    var slice = line.substring(labelEnd, sliceEnd);
+    var nums = collectAmountCandidates(slice);
+    if (nums.length === 0) continue;
+    var val = nums[0].value;
+    var lab = positions[pi].label;
+    if (lab === '小計' || lab === '税抜合計' || lab === '税抜金額' || lab === '税抜') {
+      if (!result.subtotal) { result.subtotal = val; filled++; }
+    } else if (lab === '消費税額等' || lab === '消費税額' || lab === '消費税等' || lab === '消費税' || lab === '税額') {
+      if (!result.taxAmount) { result.taxAmount = val; filled++; }
+    } else if (lab === '合計' || lab === '合計金額' || lab === '総額' || lab === '総計' ||
+               lab === '税込合計' || lab === '税込' ||
+               lab === 'ご請求金額' || lab === '御請求金額' || lab === 'ご請求額' || lab === '請求金額') {
+      if (!result.total) { result.total = val; filled++; }
+    }
+  }
+  if (filled >= 2) return result;
   return null;
 }
 
